@@ -82,21 +82,24 @@ def expire(cfg: Config, registry: Registry) -> int:
     return removed
 
 
-def sweep_strays(cfg: Config, kind: str, registry: Registry | None = None) -> int:
+def sweep_strays(cfg: Config, kind: str, registry: Registry) -> int:
     """Remove sid-shaped directories under `<workspace_root>/<kind>/` that no
     registry row points at. Never looks outside that one kind directory.
 
-    `registry` is optional so the function can also express "there is no
-    registry to consult" explicitly (nothing is protected in that case,
-    which only matters if the caller already knows nothing of that kind is
-    registered). `sweep()` -- the only production caller, wired into daemon
-    startup -- always passes the live registry, which is what makes a
-    registered workspace safe from this in practice.
+    `registry` is required, not optional, on purpose: every function in this
+    module deletes a user's data, and a default here would mean "delete
+    without checking what is live" is what happens when a caller forgets one
+    argument. There is no safe default in a deletion module -- the safe
+    choice is to force the caller to say explicitly what is registered, even
+    if that means passing an empty `Registry()` to mean "nothing is". Do not
+    restore a `= None` default: Task 17's `migrate` command is a second
+    caller of this function, and it must not be able to wipe a kind's
+    workspaces by omission.
     """
     root = paths.kind_root(cfg, kind)  # raises ValueError on a bad kind
     if not root.is_dir():
         return 0
-    registered = {sid for sid, _ in registry.items()} if registry is not None else set()
+    registered = {sid for sid, _ in registry.items()}
     removed = 0
     for child in root.iterdir():
         if not child.is_dir():

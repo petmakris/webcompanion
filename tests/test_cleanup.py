@@ -47,7 +47,7 @@ def test_the_stray_sweep_cannot_reach_another_kind(tmp_path):
     kept = _session(reg, cfg, "deck", "deck-session")
     stray = paths.kind_root(cfg, "annotate") / "251231-000000-deadbeefdeadbeef"
     stray.mkdir(parents=True)
-    assert cleanup.sweep_strays(cfg, "annotate") == 1
+    assert cleanup.sweep_strays(cfg, "annotate", reg) == 1
     assert not stray.exists()
     assert paths.base_of(kept).is_dir()
 
@@ -65,19 +65,21 @@ def test_the_stray_sweep_cannot_reach_an_unregistered_sid_of_another_kind(tmp_pa
     has something real to delete here.
     """
     cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")  # empty on purpose: nothing is registered
     deck_stray = paths.kind_root(cfg, "deck") / "251231-000000-cafebabecafebabe"
     deck_stray.mkdir(parents=True)
     annotate_stray = paths.kind_root(cfg, "annotate") / "251231-000000-deadbeefdeadbeef"
     annotate_stray.mkdir(parents=True)
-    assert cleanup.sweep_strays(cfg, "annotate") == 1
+    assert cleanup.sweep_strays(cfg, "annotate", reg) == 1
     assert not annotate_stray.exists()
     assert deck_stray.exists()
 
 
 def test_the_stray_sweep_ignores_directories_that_are_not_sid_shaped(tmp_path):
     cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")  # empty on purpose: nothing is registered
     (paths.kind_root(cfg, "annotate") / "not-a-session").mkdir(parents=True)
-    assert cleanup.sweep_strays(cfg, "annotate") == 0
+    assert cleanup.sweep_strays(cfg, "annotate", reg) == 0
 
 
 def test_a_registered_workspace_is_never_a_stray(tmp_path):
@@ -133,5 +135,5 @@ def test_a_marker_recreated_directory_is_healed_by_prune_then_sweep(tmp_path):
 
     assert cleanup.prune_dead_rows(reg) == 1
     assert reg.lookup(sid) is None
-    assert cleanup.sweep_strays(cfg, "annotate") == 1
+    assert cleanup.sweep_strays(cfg, "annotate", reg) == 1
     assert not base.exists()
