@@ -382,3 +382,44 @@ def test_a_hyphenated_root_migrates_under_its_own_kind(tmp_path):
 def test_a_root_that_does_not_exist_is_skipped_not_an_error(tmp_path):
     """Listing both spellings only works because a missing root is free."""
     assert migrate.plan([tmp_path / "never-created"]) == []
+
+
+# ── the test guard itself is under test ──────────────────────────────────
+def test_migrate_apply_under_the_guard_touches_nothing_in_the_real_home(
+        tmp_path, capsys):
+    """`migrate.run(["--apply"])` MOVES workspaces that cannot be recreated.
+
+    tests/conftest.py's autouse guard used to redirect only the DESTINATION
+    (`paths.state_root`); `migrate._default_old_roots()` read
+    `Path.home()/".claude"/<skill>`, so one `--apply` in a test moved a
+    developer's real sessions out of their home -- which happened once
+    during this project. The guard now redirects the source too.
+
+    The real home is found through `pwd`, which reads the passwd database
+    rather than $HOME, so this test cannot be fooled by the very redirection
+    it is checking.
+    """
+    import os
+    import pwd
+
+    real_home = Path(pwd.getpwuid(os.getuid()).pw_dir)
+    real_claude = real_home / ".claude"
+    before = (sorted(p.name for p in real_claude.iterdir())
+              if real_claude.is_dir() else None)
+
+    # Every source root migrate would read must be inside tmp_path.
+    for root in migrate._default_old_roots():
+        assert tmp_path in root.parents, f"{root} escapes tmp_path"
+
+    # A real legacy workspace at one of those redirected roots, so --apply
+    # has something to move and actually exercises the move.
+    old_root = migrate._default_old_roots()[0].parent
+    _old_workspace(old_root, "annotate", "250101-120000-aaaabbbbccccdddd",
+                   "plan", [{"id": "b-1", "html": "<p>hi</p>"}])
+
+    assert migrate.run(["--apply"]) == 0
+    assert "migrated" in capsys.readouterr().out.lower()
+
+    after = (sorted(p.name for p in real_claude.iterdir())
+             if real_claude.is_dir() else None)
+    assert after == before, "migrate --apply changed the real ~/.claude"

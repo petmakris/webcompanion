@@ -28,13 +28,18 @@ from pathlib import Path
 
 from webcompanion import config as cfgmod
 from webcompanion import paths
+from webcompanion.commands import install_service as svc
 from webcompanion.commands.install_service import (
     DEFAULT_LABEL,
     DEFAULT_SERVICE_NAME,
-    default_plist_path,
-    default_unit_path,
-    default_zipapp_path,
 )
+
+# The three default paths are reached through `svc.` rather than imported by
+# name ON PURPOSE. They are what the test guard in tests/conftest.py
+# redirects; a `from ... import default_zipapp_path` binds the real function
+# into this module at import time, and the guard's patch on
+# `install_service` would then never be seen here -- which is exactly how an
+# uninstall in a test could reach a developer's real ~/.local/share.
 
 
 def _stop(system: str, unit_path: Path, label: str) -> list[str]:
@@ -93,8 +98,8 @@ def run(argv: list[str], *, target_dir: Path | None = None,
         unit_path = Path(target_dir) / (
             f"{label}.plist" if system == "darwin" else DEFAULT_SERVICE_NAME)
     else:
-        unit_path = (default_plist_path(label) if system == "darwin"
-                     else default_unit_path())
+        unit_path = (svc.default_plist_path(label) if system == "darwin"
+                     else svc.default_unit_path())
 
     problems: list[str] = []
     if target_dir is None:
@@ -106,7 +111,13 @@ def run(argv: list[str], *, target_dir: Path | None = None,
     removed = []
     if _remove(unit_path):
         removed.append(str(unit_path))
-    pyz = default_zipapp_path()
+    # `target_dir` scopes the ZIPAPP too, not just the service file. It used
+    # to name only the plist/unit while the zipapp stayed at the real
+    # default, so `run(target_dir=<tmp>)` -- the shape every test uses
+    # precisely to stay off the real machine -- deleted the developer's
+    # actually-installed webcompanion.pyz.
+    pyz = (Path(target_dir) / "webcompanion.pyz" if target_dir is not None
+           else svc.default_zipapp_path())
     if _remove(pyz):
         removed.append(str(pyz))
 

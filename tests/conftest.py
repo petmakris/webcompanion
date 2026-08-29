@@ -3,6 +3,7 @@ from __future__ import annotations
 import json
 import urllib.error
 import urllib.request
+from pathlib import Path
 
 import pytest
 
@@ -10,10 +11,16 @@ from webcompanion import paths
 from webcompanion.config import Config, mint_token
 from webcompanion.server import Daemon
 
+# Resolved at import time, BEFORE any test redirects HOME.
+_REAL_PLAYWRIGHT_CACHE = next(
+    (p for p in (Path.home() / "Library" / "Caches" / "ms-playwright",
+                 Path.home() / ".cache" / "ms-playwright")
+     if p.is_dir()), None)
+
 
 @pytest.fixture(autouse=True)
 def _never_the_real_state_root(request, tmp_path, monkeypatch):
-    """No test may touch `~/.claude/webcompanion`.
+    """No test may touch anything under the developer's real home.
 
     Earned the hard way while writing tests/test_integration.py: a test that
     called `migrate.run(["--apply"])` with only `config_path` patched still
@@ -24,13 +31,69 @@ def _never_the_real_state_root(request, tmp_path, monkeypatch):
     machine -- so the blast radius of one unpatched call is a user's actual
     sessions, not a stray temp file.
 
+    SOURCE AND DESTINATION, TOGETHER. Redirecting `paths.state_root()` alone
+    protects only where data is written TO. `migrate._default_old_roots()`
+    reads `Path.home()/".claude"/<skill>`, so a guard that stops at the
+    destination still lets one `migrate.run(["--apply"])` MOVE a developer's
+    real workspaces out of their home -- the move succeeds, it just lands
+    somewhere else. So this fixture redirects both ends:
+
+    - `HOME`, which is what `Path.home()` and `os.path.expanduser("~")`
+      read, so anything computing a path from the home directory that is
+      not named below lands in `tmp_path` too instead of escaping.
+    - Every function that spells a real path out, patched BY NAME so it
+      breaks loudly if it is ever renamed rather than silently reverting to
+      the real path: `paths.state_root`, `cfgmod.config_path`,
+      `migrate._default_old_roots`, and the three service paths
+      `default_plist_path`, `default_unit_path`, `default_zipapp_path`.
+
+    tests/test_migrate.py asserts this holds, by running the real
+    `migrate.run(["--apply"])` under it and checking the real `~/.claude`
+    -- found through `pwd`, not $HOME -- is untouched afterwards.
+
     A test that genuinely means to assert the real default path opts out
     with `@pytest.mark.real_state_root`, which is loud enough to be noticed
     in review. Everything else is redirected whether it asked or not.
     """
     if request.node.get_closest_marker("real_state_root"):
         return
+
+    from webcompanion import config as cfgmod
+    from webcompanion.commands import install_service as svc
+    from webcompanion.commands import migrate
+
+    # NOT created on disk: a test whose subject IS `tmp_path` (see
+    # tests/test_threads.py) counts what is in there, and an empty directory
+    # this fixture minted would be a stranger in that listing. `Path.home()`
+    # does not require the directory to exist, and anything that genuinely
+    # writes under it creates it on the way.
+    fake_home = tmp_path / "_home"
+    monkeypatch.setenv("HOME", str(fake_home))
+    # Playwright resolves its downloaded-browser cache from HOME, so the one
+    # test that drives a real browser would look for chromium inside the
+    # fake home and find nothing there. Point it back at the real cache: it
+    # is a read-only download cache, not user data, and a browser download
+    # is not what this guard exists to contain.
+    if _REAL_PLAYWRIGHT_CACHE is not None:
+        monkeypatch.setenv("PLAYWRIGHT_BROWSERS_PATH",
+                           str(_REAL_PLAYWRIGHT_CACHE))
+
     monkeypatch.setattr(paths, "state_root", lambda: tmp_path / "_state_root")
+    monkeypatch.setattr(
+        cfgmod, "config_path",
+        lambda: tmp_path / "_state_root" / "config.json")
+    monkeypatch.setattr(
+        migrate, "_default_old_roots",
+        lambda: [fake_home / ".claude" / name for name in migrate._OLD_SKILLS])
+    monkeypatch.setattr(
+        svc, "default_plist_path",
+        lambda label=svc.DEFAULT_LABEL: tmp_path / "_agents" / f"{label}.plist")
+    monkeypatch.setattr(
+        svc, "default_unit_path",
+        lambda name=svc.DEFAULT_SERVICE_NAME: tmp_path / "_agents" / name)
+    monkeypatch.setattr(
+        svc, "default_zipapp_path",
+        lambda: tmp_path / "_share" / "webcompanion.pyz")
 
 
 @pytest.fixture

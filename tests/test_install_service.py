@@ -4,6 +4,7 @@ import json
 import plistlib
 import sys
 import zipfile
+from pathlib import Path
 
 import pytest
 
@@ -233,9 +234,12 @@ def test_uninstall_removes_the_service_file_and_the_zipapp(tmp_path, monkeypatch
             else svc.DEFAULT_SERVICE_NAME)
     unit = target / name
     unit.write_text("<service definition>")
-    pyz = tmp_path / "webcompanion.pyz"
+    # Inside `target`, because target_dir now scopes the zipapp too -- it
+    # used to name only the plist/unit while the zipapp stayed at the real
+    # ~/.local/share path, so this very test deleted a developer's installed
+    # webcompanion.pyz.
+    pyz = target / "webcompanion.pyz"
     pyz.write_text("zipapp")
-    monkeypatch.setattr(unins, "default_zipapp_path", lambda: pyz)
     monkeypatch.setattr(cfgmod, "config_path", lambda: tmp_path / "config.json")
 
     assert unins.run([], target_dir=target) == 0
@@ -253,8 +257,6 @@ def test_uninstall_leaves_the_config_and_the_workspaces_alone(tmp_path, monkeypa
     cfgmod.write(cfgmod.Config(token="keep-me",
                                workspace_root=tmp_path / "ws"), config)
     monkeypatch.setattr(cfgmod, "config_path", lambda: config)
-    monkeypatch.setattr(unins, "default_zipapp_path",
-                        lambda: tmp_path / "absent.pyz")
     workspace = tmp_path / "ws" / "annotate" / "250101-120000-aaaabbbbccccdddd"
     workspace.mkdir(parents=True)
 
@@ -272,8 +274,6 @@ def test_uninstall_leaves_the_config_and_the_workspaces_alone(tmp_path, monkeypa
 
 def test_uninstalling_twice_is_not_an_error(tmp_path, monkeypatch, capsys):
     monkeypatch.setattr(cfgmod, "config_path", lambda: tmp_path / "config.json")
-    monkeypatch.setattr(unins, "default_zipapp_path",
-                        lambda: tmp_path / "absent.pyz")
     target = tmp_path / "agents"
     target.mkdir()
 
@@ -293,8 +293,6 @@ def test_uninstall_never_shells_out_for_a_throwaway_target(tmp_path, monkeypatch
     monkeypatch.setattr(unins.subprocess, "run",
                         lambda cmd, **kw: calls.append(list(cmd)))
     monkeypatch.setattr(cfgmod, "config_path", lambda: tmp_path / "config.json")
-    monkeypatch.setattr(unins, "default_zipapp_path",
-                        lambda: tmp_path / "absent.pyz")
     target = tmp_path / "agents"
     target.mkdir()
 
@@ -311,3 +309,28 @@ def test_the_stop_step_names_the_unit_file_on_linux(tmp_path, monkeypatch):
     unins._stop("linux", tmp_path / svc.DEFAULT_SERVICE_NAME, svc.DEFAULT_LABEL)
     assert any(svc.DEFAULT_SERVICE_NAME in c for c in calls)
     assert not any(svc.DEFAULT_LABEL in c for c in calls)
+
+
+def test_a_throwaway_uninstall_never_reaches_the_real_zipapp(tmp_path, monkeypatch,
+                                                             capsys):
+    """`target_dir` is what every test passes to stay off the real machine.
+    It used to scope only the plist/unit; the zipapp path stayed at the real
+    `~/.local/share/webcompanion/webcompanion.pyz` and was unlinked anyway.
+
+    Records every path `uninstall` asks to remove instead of checking
+    whether a file survived. A survival check passes vacuously on a machine
+    where the real zipapp happens not to be installed -- which is most CI
+    machines, and is exactly how this got shipped.
+    """
+    asked: list[Path] = []
+    monkeypatch.setattr(unins, "_remove",
+                        lambda path: asked.append(Path(path)) or False)
+    monkeypatch.setattr(cfgmod, "config_path", lambda: tmp_path / "config.json")
+
+    target = tmp_path / "agents"
+    target.mkdir()
+    assert unins.run([], target_dir=target) == 0
+
+    assert asked, "uninstall considered nothing for removal"
+    outside = [p for p in asked if target not in p.parents]
+    assert outside == [], f"a throwaway uninstall reached outside {target}"
