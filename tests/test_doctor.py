@@ -140,17 +140,58 @@ def test_doctor_reports_an_unreadable_sessions_file(wired, tmp_path, monkeypatch
     assert "refuses its startup stray sweep" in out
 
 
+def test_doctor_reads_the_log_file_the_installed_service_actually_writes(
+        tmp_path, monkeypatch):
+    """The one assertion that would have caught the mismatch this test file
+    used to hide.
+
+    `doctor.log_path()` said `webcompanion.log`; the plist `install-service`
+    writes on macOS -- the primary platform -- pointed StandardErrorPath at
+    `dev.webcompanion.log`. The old test wrote the log file itself, under
+    the name it had chosen, so it passed against a `doctor` that was reading
+    a file nothing ever wrote. So: no filename appears in this test at all.
+    It parses the service definition `install-service` renders and compares
+    `doctor`'s path to the path found INSIDE it.
+    """
+    import plistlib
+    import sys
+
+    from webcompanion import paths as pathsmod
+    from webcompanion.commands import install_service as svc
+
+    state = tmp_path / "state"
+    monkeypatch.setattr(pathsmod, "state_root", lambda: state)
+
+    pyz = tmp_path / "webcompanion.pyz"
+    if sys.platform == "darwin":
+        rendered = svc.render_plist(pyz=pyz, log_dir=pathsmod.state_root(),
+                                    label=svc.DEFAULT_LABEL)
+        written_to = plistlib.loads(rendered.encode())["StandardErrorPath"]
+    else:
+        rendered = svc.render_unit(pyz=pyz, log_dir=pathsmod.state_root())
+        written_to = next(
+            line.split("append:", 1)[1]
+            for line in rendered.splitlines()
+            if line.startswith("StandardError="))
+
+    assert str(doctor.log_path()) == written_to
+
+
 def test_doctor_tails_the_service_log(wired, tmp_path, monkeypatch, capsys):
     """A user told "see the log" and left to find it has been told nothing:
-    launchd rotates it and nobody reads it until something else breaks."""
+    launchd rotates it and nobody reads it until something else breaks.
+
+    Writes to `doctor.log_path()` rather than to a filename of its own, so
+    it cannot pass while `doctor` tails a file the service never writes --
+    the path itself is pinned by the test above.
+    """
     from webcompanion import paths as pathsmod
 
     _pretend_installed(monkeypatch, tmp_path)
     state = tmp_path / "state"
     state.mkdir(exist_ok=True)
-    (state / "webcompanion.log").write_text(
-        "\n".join(f"line {i}" for i in range(50)))
     monkeypatch.setattr(pathsmod, "state_root", lambda: state)
+    doctor.log_path().write_text("\n".join(f"line {i}" for i in range(50)))
 
     doctor.run([])
     out = capsys.readouterr().out

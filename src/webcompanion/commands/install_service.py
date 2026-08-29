@@ -51,6 +51,31 @@ def default_unit_path(name: str = DEFAULT_SERVICE_NAME) -> Path:
     return Path(f"~/.config/systemd/user/{name}").expanduser()
 
 
+def service_log_paths(log_dir: Path, *, system: str,
+                      label: str = DEFAULT_LABEL) -> tuple[Path, Path]:
+    """(stdout log, stderr log) for the service on `system`.
+
+    THE ONE PLACE the service's log filenames are decided. `render_plist`,
+    `render_unit` and `doctor.log_path` all go through it, because they
+    drifted apart the moment they each spelled the name out: the plist
+    logged to `dev.webcompanion.log` while `doctor` tailed
+    `webcompanion.log`, so on macOS -- the primary platform -- the log tail
+    reported an empty log however full the real one was.
+
+    The stems differ per platform on purpose and are kept that way: the
+    plist is named after the launchd label, which is what a macOS user sees
+    in `launchctl list`, while the systemd unit is named after the program.
+    """
+    stem = label if system == "darwin" else "webcompanion"
+    return log_dir / f"{stem}.out.log", log_dir / f"{stem}.log"
+
+
+def default_log_path(label: str = DEFAULT_LABEL) -> Path:
+    """The file the service running on THIS machine writes its stderr to."""
+    system = "darwin" if sys.platform == "darwin" else "linux"
+    return service_log_paths(paths.state_root(), system=system, label=label)[1]
+
+
 def _read_template(name: str) -> str:
     with as_file(files("webcompanion").joinpath("service", name)) as p:
         return p.read_text()
@@ -58,26 +83,28 @@ def _read_template(name: str) -> str:
 
 def render_plist(*, pyz: Path, log_dir: Path, label: str,
                   throttle: int = DEFAULT_THROTTLE_SECONDS) -> str:
-    log_dir = Path(log_dir)
+    out_log, err_log = service_log_paths(Path(log_dir), system="darwin",
+                                         label=label)
     tmpl = string.Template(_read_template("dev.webcompanion.plist"))
     return tmpl.substitute(
         label=_xml_escape(label),
         pyz=_xml_escape(str(pyz)),
         throttle=str(int(throttle)),
-        out_log=_xml_escape(str(log_dir / f"{label}.out.log")),
-        err_log=_xml_escape(str(log_dir / f"{label}.log")),
+        out_log=_xml_escape(str(out_log)),
+        err_log=_xml_escape(str(err_log)),
     )
 
 
 def render_unit(*, pyz: Path, log_dir: Path | None = None,
                  restart_sec: int = DEFAULT_RESTART_SECONDS) -> str:
     log_dir = Path(log_dir) if log_dir is not None else paths.state_root()
+    out_log, err_log = service_log_paths(log_dir, system="linux")
     tmpl = string.Template(_read_template("webcompanion.service"))
     return tmpl.substitute(
         pyz=str(pyz),
         restart_sec=str(int(restart_sec)),
-        out_log=str(log_dir / "webcompanion.out.log"),
-        err_log=str(log_dir / "webcompanion.log"),
+        out_log=str(out_log),
+        err_log=str(err_log),
     )
 
 

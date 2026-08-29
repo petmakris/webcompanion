@@ -25,6 +25,7 @@ from webcompanion.client import Client, ContractMismatch, DaemonUnreachable, Htt
 from webcompanion.commands.install_service import (
     DEFAULT_LABEL,
     DEFAULT_SERVICE_NAME,
+    default_log_path,
     default_plist_path,
     default_unit_path,
     default_zipapp_path,
@@ -88,8 +89,13 @@ def _supervisor_knows_the_job() -> bool | None:
 
 
 def log_path() -> Path:
-    """Where install-service points the service's stderr."""
-    return paths.state_root() / "webcompanion.log"
+    """Where install-service points the service's stderr.
+
+    Derived from `install_service.service_log_paths`, the same function that
+    renders the plist and the unit, so the reader and the writer cannot
+    disagree about the filename again.
+    """
+    return default_log_path()
 
 
 def _log_tail(n: int = LOG_TAIL_LINES) -> list[str] | None:
