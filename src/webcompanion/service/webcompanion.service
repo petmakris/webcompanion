@@ -1,0 +1,14 @@
+[Unit]
+Description=webcompanion companion service
+After=network.target
+
+[Service]
+Type=simple
+ExecStart=/usr/bin/env python3 ${pyz} serve
+Restart=always
+RestartSec=${restart_sec}
+StandardOutput=append:${out_log}
+StandardError=append:${err_log}
+
+[Install]
+WantedBy=default.target

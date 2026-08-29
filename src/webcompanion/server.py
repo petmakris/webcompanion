@@ -171,10 +171,24 @@ class Daemon:
         # start.
         try:
             cleanup.sweep(self.cfg, self.registry)
-        except Exception:
+        except Exception as exc:
             print("webcompanion: startup cleanup sweep failed, continuing:",
                   file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
+            # A stderr line alone means nobody learns cleanup stopped
+            # running -- launchd's log rotates and nobody reads it until
+            # something else breaks. Drop a durable marker under
+            # state_root so `doctor` can surface this instead.
+            try:
+                write_text_atomic(
+                    self.state_root / "startup_sweep_failed.json",
+                    json.dumps({
+                        "when": time.time(),
+                        "error": f"{type(exc).__name__}: {exc}",
+                    }, indent=2),
+                )
+            except OSError:
+                pass
         self.registry.persist()
         handler = _make_handler(self)
         self._httpd = ThreadingHTTPServer((self.cfg.bind, self.cfg.port), handler)
