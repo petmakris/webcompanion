@@ -74,8 +74,9 @@ def _derive_versions_unlocked(chain_path, bodies):
     """Unlocked variant to reproduce the read-compute-write race.
 
     This is used to prove the test harness can detect the bug when
-    synchronization is missing.
+    synchronization is missing. Includes a sleep to widen the race window.
     """
+    import time
     from webcompanion.versions import _load_chain, body_hash
     from webcompanion.atomic import write_text_atomic
 
@@ -86,6 +87,10 @@ def _derive_versions_unlocked(chain_path, bodies):
     for stale in [k for k in chain if k not in bodies]:
         del chain[stale]
         changed = True
+
+    # Widen the race window: give other threads time to read the same
+    # base state before this thread computes and writes
+    time.sleep(0.005)
 
     for anchor, body in bodies.items():
         if not isinstance(anchor, str):
@@ -154,9 +159,10 @@ def test_unlocked_variant_loses_updates(tmp_path):
     initial = {f"b-{i}": {"v": 0} for i in range(8)}
     _derive_versions_unlocked(p, initial)
 
-    # Each thread bumps only its own anchor using the unlocked variant
+    # Each thread bumps its own anchor while preserving others (same harness as locked test)
     def bump_anchor(i):
-        _derive_versions_unlocked(p, {f"b-{i}": {"v": i+1}})
+        bodies = {f"b-{j}": {"v": i+1 if i == j else 0} for j in range(8)}
+        _derive_versions_unlocked(p, bodies)
 
     threads = [threading.Thread(target=bump_anchor, args=(i,)) for i in range(8)]
     for t in threads:
@@ -164,9 +170,8 @@ def test_unlocked_variant_loses_updates(tmp_path):
     for t in threads:
         t.join()
 
-    # This SHOULD lose some updates (some anchors missing or < 2 entries)
+    # This SHOULD lose some updates (some anchors < 2 entries)
     # If it doesn't, the harness is not hitting the race
     chain_data = json.loads((p).read_text())
-    missing_or_incomplete = [i for i in range(8)
-                            if f"b-{i}" not in chain_data or len(chain_data[f"b-{i}"]) < 2]
-    assert missing_or_incomplete, f"Harness does not create contention; no lost updates observed: {chain_data}"
+    incomplete = [i for i in range(8) if len(chain_data.get(f"b-{i}", [])) < 2]
+    assert incomplete, f"Harness does not create contention; no lost updates observed: {chain_data}"
