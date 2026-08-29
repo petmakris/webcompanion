@@ -52,6 +52,28 @@ def test_the_stray_sweep_cannot_reach_another_kind(tmp_path):
     assert paths.base_of(kept).is_dir()
 
 
+def test_the_stray_sweep_cannot_reach_an_unregistered_sid_of_another_kind(tmp_path):
+    """The brief's isolation test uses a non-sid-shaped `kept` sid
+    ("deck-session"), and a registered one at that -- so it cannot fail
+    against a mutation that widens the scan recursively but still filters by
+    sid shape and by registration: such a mutation would never touch
+    "deck-session" regardless of scope, sid-shaped or not, registered or not.
+
+    This closes that gap with an UNREGISTERED, sid-shaped stray sitting in a
+    different kind. Nothing but the kind-directory boundary protects it, so
+    a scope-widening mutation that still respects sid-shape and registration
+    has something real to delete here.
+    """
+    cfg = Config(workspace_root=tmp_path / "ws")
+    deck_stray = paths.kind_root(cfg, "deck") / "251231-000000-cafebabecafebabe"
+    deck_stray.mkdir(parents=True)
+    annotate_stray = paths.kind_root(cfg, "annotate") / "251231-000000-deadbeefdeadbeef"
+    annotate_stray.mkdir(parents=True)
+    assert cleanup.sweep_strays(cfg, "annotate") == 1
+    assert not annotate_stray.exists()
+    assert deck_stray.exists()
+
+
 def test_the_stray_sweep_ignores_directories_that_are_not_sid_shaped(tmp_path):
     cfg = Config(workspace_root=tmp_path / "ws")
     (paths.kind_root(cfg, "annotate") / "not-a-session").mkdir(parents=True)

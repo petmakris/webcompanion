@@ -29,7 +29,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from webcompanion import CONTRACT, __version__
-from webcompanion import anchors, events, gate, items, paths, stream, threads, uploads
+from webcompanion import anchors, cleanup, events, gate, items, paths, stream, threads, uploads
 from webcompanion.atomic import write_text_atomic
 from webcompanion.config import Config
 from webcompanion.registry import Registry
@@ -162,6 +162,8 @@ class Daemon:
 
     def start(self) -> None:
         self.registry.rehydrate()
+        cleanup.sweep(self.cfg, self.registry)
+        self.registry.persist()
         handler = _make_handler(self)
         self._httpd = ThreadingHTTPServer((self.cfg.bind, self.cfg.port), handler)
         self._httpd.daemon_threads = True
