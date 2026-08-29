@@ -73,6 +73,12 @@ def _client_gone(handler) -> bool:
     is consumed) on a readable socket means EOF, not "a request queued up
     behind this one" — clients never send anything after opening the
     stream.
+
+    `select.select` validates the fd before the syscall and raises
+    `ValueError` (not `OSError`) when `fileno()` is -1 — the socket already
+    closed server-side, e.g. during shutdown. That is just as much "the
+    client is gone" as any other closed-socket error, so it is caught
+    alongside OSError rather than left to escape into the request thread.
     """
     try:
         sock = handler.connection
@@ -80,7 +86,7 @@ def _client_gone(handler) -> bool:
         if not readable:
             return False
         return sock.recv(1, socket.MSG_PEEK) == b""
-    except OSError:
+    except (OSError, ValueError):
         return True
 
 

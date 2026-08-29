@@ -33,9 +33,16 @@ def _hard_timeout():
         signal.signal(signal.SIGALRM, old)
 
 
-def _read_frames(url, count, timeout=5):
-    """Read `count` SSE frames as (event, data) pairs."""
+def _read_frames(url, count, timeout=5, sync_after=None, sync_event=None):
+    """Read `count` SSE frames as (event, data) pairs.
+
+    If `sync_event` is given, it is set once `sync_after` frames have been
+    parsed (default 1, i.e. just the "connected" frame) — so a caller can
+    block until the stream has reached a known point instead of guessing
+    with a sleep.
+    """
     frames, name = [], None
+    threshold = sync_after if sync_after is not None else 1
     with urllib.request.urlopen(url, timeout=timeout) as r:
         for raw in r:
             line = raw.decode().rstrip("\n")
@@ -44,6 +51,8 @@ def _read_frames(url, count, timeout=5):
             elif line.startswith("data: ") and name:
                 frames.append((name, json.loads(line[6:])))
                 name = None
+                if sync_event is not None and len(frames) == threshold:
+                    sync_event.set()
                 if len(frames) >= count:
                     return frames
     return frames
@@ -59,11 +68,24 @@ def test_an_item_write_emits_item_changed_with_the_new_version(daemon, call):
     s = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})[1]
     call("PUT", f"/s/{s['sid']}/items/b-1", {"t": "a"})
     got = []
+    # serve() runs, on one thread with no I/O wait in between: emit
+    # connected -> snapshot last_items/last_threads -> emit the initial
+    # item-changed echo for the pre-existing anchor -> capture
+    # `seen = registry.version(sid)`. Waiting only for "connected" (frame
+    # 1) left a window open on a fast loopback round trip: the second PUT's
+    # note_change() could land between that snapshot and the `seen` read,
+    # bumping the counter to a value `seen` already captures, so the wait
+    # loop believes nothing happened after `seen` and the update is
+    # dropped for good (reproduced deterministically once the 0.3s sleep
+    # was removed). Waiting for frame 2 -- the item-changed echo of b-1's
+    # existing version -- pins the handoff to just after that snapshot,
+    # collapsing the race to a single non-yielding statement.
+    sync = threading.Event()
     t = threading.Thread(
-        target=lambda: got.extend(_read_frames(f"{daemon.url}/s/{s['sid']}/stream", 3)))
+        target=lambda: got.extend(_read_frames(
+            f"{daemon.url}/s/{s['sid']}/stream", 3, sync_after=2, sync_event=sync)))
     t.start()
-    import time
-    time.sleep(0.3)
+    assert sync.wait(timeout=5), "stream never echoed the pre-existing item"
     call("PUT", f"/s/{s['sid']}/items/b-1", {"t": "CHANGED"})
     t.join(timeout=5)
     changed = [f for f in got if f[0] == "item-changed"]
@@ -115,3 +137,19 @@ def test_the_cap_refuses_a_stream_rather_than_exhausting_threads(daemon, call, m
     monkeypatch.setattr(stream, "MAX_CONCURRENT_STREAMS", 0)
     s = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})[1]
     assert call("GET", f"/s/{s['sid']}/stream")[0] == 503
+
+
+def test_client_gone_treats_a_closed_fd_as_disconnected_not_an_error():
+    """select.select validates the fd's sign before the syscall and raises
+    ValueError (not OSError) for fileno() == -1 -- the shape a
+    server-side-already-closed socket takes during shutdown. That must be
+    treated as "client gone" like any other closed-socket error, not escape
+    into the request thread."""
+    class _ClosedConnection:
+        def fileno(self):
+            return -1
+
+    class _FakeHandler:
+        connection = _ClosedConnection()
+
+    assert stream._client_gone(_FakeHandler()) is True
