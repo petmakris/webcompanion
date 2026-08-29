@@ -127,6 +127,29 @@ def test_resolve_all_on_a_body_where_code_is_not_a_list_is_empty(repo):
     assert anchors.resolve_all({"code": "not-a-list"}, repo) == []
 
 
+def test_resolve_all_filters_before_capping(repo):
+    # The cap means "at most MAX_ANCHORS anchors I will actually render", not
+    # "at most MAX_ANCHORS list positions I will look at". Four non-dict junk
+    # entries ahead of one valid anchor must not consume the cap and starve
+    # the good anchor out — under a slice-then-filter ordering this list
+    # would resolve nothing.
+    body = {"code": ["not-a-dict", 42, None, [1, 2],
+                     {"file": "src/app.py", "line": 10, "snippet": "line 10"}]}
+    out = anchors.resolve_all(body, repo)
+    assert len(out) == 1
+    assert out[0]["status"] == "ok"
+
+
+def test_resolve_all_on_a_non_dict_body_is_empty(repo):
+    assert anchors.resolve_all(None, repo) == []
+    assert anchors.resolve_all("not-a-body", repo) == []
+    assert anchors.resolve_all([1, 2, 3], repo) == []
+
+
+def test_resolve_all_on_an_empty_code_list_is_empty(repo):
+    assert anchors.resolve_all({"code": []}, repo) == []
+
+
 @pytest.mark.parametrize("bad,expect", [
     ({}, "must be"),
     ({"file": "", "line": 1, "snippet": "x"}, "non-empty"),

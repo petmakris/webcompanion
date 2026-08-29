@@ -92,8 +92,8 @@ def resolve_all(body: dict, root: Path) -> list:
     code = body.get("code") if isinstance(body, dict) else None
     if not isinstance(code, list):
         return []
-    return [resolve_anchor(a, root) for a in code[:MAX_ANCHORS]
-            if isinstance(a, dict)]
+    dicts = [a for a in code if isinstance(a, dict)]
+    return [resolve_anchor(a, root) for a in dicts[:MAX_ANCHORS]]
 
 
 def _fail(a: dict, status: str, message: str) -> dict:
