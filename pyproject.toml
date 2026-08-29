@@ -20,6 +20,11 @@ classifiers = [
   "Operating System :: POSIX :: Linux",
 ]
 
+[project.urls]
+Homepage = "https://github.com/petmakris/webcompanion"
+Repository = "https://github.com/petmakris/webcompanion"
+Issues = "https://github.com/petmakris/webcompanion/issues"
+
 [project.scripts]
 webcompanion = "webcompanion.cli:main"
 

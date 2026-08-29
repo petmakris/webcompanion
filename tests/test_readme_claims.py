@@ -139,3 +139,74 @@ def test_the_docs_two_route_listings_agree():
 def test_the_contract_number_matches_the_package():
     doc = (Path(__file__).resolve().parents[1] / "docs" / "contract.md").read_text()
     assert f"contract {webcompanion.CONTRACT}" in doc
+
+
+# ── the configuration file must be documented, field by field ────────────
+
+def test_every_config_field_is_documented_in_the_readme():
+    """port, bind, token, retention_days and workspace_root were all parsed
+    and none appeared in the README or docs/. A setting nobody can find is a
+    setting nobody can use -- and `bind` in particular decides whether one
+    daemon exposes every project on the machine."""
+    import dataclasses
+
+    from webcompanion.config import Config
+
+    text = README.read_text()
+    for field in dataclasses.fields(Config):
+        assert f"`{field.name}`" in text, (
+            f"config field {field.name!r} is parsed but undocumented")
+
+
+def test_the_readme_states_the_two_defaults_that_delete_or_expose():
+    """Both are load-bearing and both are easy to change by accident."""
+    text = README.read_text()
+    assert "infinite" in text, "retention_days defaulting to infinite is unstated"
+    assert "every project on the machine" in text, (
+        "the README does not say what binding beyond loopback exposes")
+
+
+def test_the_readme_documents_the_ack_step():
+    """Without it, an answered event is reported to the user as dropped 90
+    minutes later."""
+    text = README.read_text()
+    assert "webcompanion ack" in text
+    assert "WEBCOMPANION_DROPPED" in text
+
+
+def test_the_readme_documents_uninstall_and_what_it_keeps():
+    text = README.read_text()
+    assert "webcompanion uninstall" in text
+    assert "Leaves the config file and every workspace alone" in text
+
+
+def test_the_readmes_doc_links_are_absolute_so_they_resolve_on_pypi():
+    """A relative link in a README rendered on PyPI points at PyPI, which
+    has no docs/ directory -- so every link to the contract was dead
+    exactly where a new reader finds the package."""
+    for link in re.findall(r"\]\(([^)]+)\)", README.read_text()):
+        if link.startswith("#"):
+            continue
+        assert link.startswith("http"), f"relative link on the PyPI page: {link}"
+
+
+def test_the_sdist_ships_the_contract_document():
+    """MANIFEST.in is the only thing that puts docs/ in a source
+    distribution; setuptools does not include it by default."""
+    manifest = Path(__file__).resolve().parents[1] / "MANIFEST.in"
+    assert manifest.is_file()
+    assert "docs" in manifest.read_text()
+
+
+def test_the_package_declares_where_it_lives():
+    """Without [project.urls] the PyPI page has no links at all."""
+    import tomllib
+
+    pyproject = Path(__file__).resolve().parents[1] / "pyproject.toml"
+    with pyproject.open("rb") as f:
+        data = tomllib.load(f)
+    urls = data["project"].get("urls", {})
+    assert {"Homepage", "Repository", "Issues"} <= set(urls)
+    assert data["project"]["dependencies"] == [], (
+        "project.dependencies must stay empty -- the service runs as a "
+        "zipapp on the system python, with nothing to install")

@@ -1,0 +1,11 @@
+# The sdist must carry the contract document. README.md links to it and the
+# PyPI page's links point at the repository, but a source distribution that
+# omits the one document written for people implementing a client against
+# this daemon is a source distribution missing its interface spec.
+include README.md
+include LICENSE
+recursive-include docs *.md
+recursive-include src/webcompanion/static *
+recursive-include src/webcompanion/service *
+include src/webcompanion/py.typed
+recursive-include tests *.py
