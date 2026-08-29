@@ -20,6 +20,13 @@ classifiers = [
 [project.scripts]
 webcompanion = "webcompanion.cli:main"
 
+[project.optional-dependencies]
+# Dev-only. `dependencies` above stays [] -- that is what a `pipx install
+# webcompanion` user gets, and CI asserts it directly. playwright drives a
+# real browser against the daemon for tests/test_browser_runtime.py; it is
+# never imported by anything under src/.
+dev = ["pytest", "playwright"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 
