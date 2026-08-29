@@ -192,7 +192,7 @@ def test_a_corrupt_sessions_file_does_not_let_the_boot_sweep_delete_workspaces(t
     finally:
         again.stop()
     # The unreadable file itself is preserved, not clobbered by the new one.
-    assert list(state_root.glob("sessions.json.corrupt-*"))
+    assert (state_root / "sessions.json.unreadable").is_file()
 
 
 def test_an_empty_registry_facing_a_populated_workspace_root_refuses_the_sweep(tmp_path):
@@ -279,3 +279,95 @@ def test_a_reaped_workspace_ends_the_watch_instead_of_being_recreated(
                           dirs["consumed_dir"], out=out, poll_seconds=0.01)
     assert rc == 0
     assert "WEBCOMPANION_CANCELLED" in out.getvalue()
+
+
+# ── C5: the corrupt registry must not destroy workspaces two boots later ──
+def test_three_boots_after_one_corrupt_registry_still_have_every_workspace(tmp_path):
+    """The reproduced data loss, run end to end.
+
+    Refusing the sweep on an UNREADABLE registry was armed by a condition
+    the daemon itself then destroyed, and the second guard was a boolean one
+    new session disarmed:
+
+        start: 3 workspaces, valid registry
+        boot1 (corrupt):  sessions.json was replaced with '{}'
+        boot2:            registry empty -> refused, still 3
+        one new session:  4 directories, 1 registry row
+        boot3:            1 row read as trustworthy -> the other 3 swept
+
+    So this test asserts the ORIGINAL three by name after the third boot,
+    not merely that a count is non-zero: the count was 1, and it was the
+    wrong one.
+    """
+    state_root = tmp_path / "state"
+    cfg = Config(port=0, token=mint_token(), bind="127.0.0.1",
+                 workspace_root=tmp_path / "ws")
+
+    def boot(then=None):
+        d = Daemon(cfg, state_root=state_root)
+        d.start()
+        try:
+            return then(d) if then else None
+        finally:
+            d.stop()
+
+    boot(lambda d: [_post_session(d, tmp_path, kind="annotate")
+                    for _ in range(3)])
+    original = sorted(p.name for p in (cfg.workspace_root / "annotate").iterdir())
+    assert len(original) == 3
+
+    (state_root / "sessions.json").write_text('{"250101-120000-aaaa')
+
+    boot()  # boot1: the corrupt registry is read
+    boot()  # boot2
+    boot(lambda d: _post_session(d, tmp_path, kind="annotate"))  # one new session
+    boot()  # boot3: where all three used to be deleted
+
+    survivors = sorted(p.name for p in (cfg.workspace_root / "annotate").iterdir())
+    assert [s for s in original if s not in survivors] == [], (
+        "the original workspaces were destroyed two boots after the corruption")
+    assert len(survivors) == 4
+
+    # And the unreadable bytes are still recoverable, under a fixed name.
+    assert (state_root / "sessions.json.unreadable").is_file()
+
+    marker = json.loads((state_root / "startup_sweep_failed.json").read_text())
+    assert "1 live registry row" in marker["refused"]
+    assert "4 session directories" in marker["refused"]
+
+
+def test_a_clean_boot_clears_the_startup_sweep_marker(tmp_path):
+    """`doctor` exits 1 while the marker exists, and the marker used to be
+    written once and never removed -- so one refused boot made `doctor` fail
+    forever, while the marker's own advice was "fix the cause and restart",
+    which is precisely what did not clear it.
+
+    Drives the whole loop: refuse a boot, repair the registry the way a user
+    would, boot again, and read the marker through `doctor` rather than
+    through the filename, so the exit code and the file agree.
+    """
+    state_root = tmp_path / "state"
+    cfg = Config(port=0, token=mint_token(), bind="127.0.0.1",
+                 workspace_root=tmp_path / "ws")
+
+    daemon = Daemon(cfg, state_root=state_root)
+    daemon.start()
+    try:
+        _post_session(daemon, tmp_path, kind="annotate")
+    finally:
+        daemon.stop()
+    healthy_registry = (state_root / "sessions.json").read_text()
+
+    (state_root / "sessions.json").write_text('{"250101-120000-aaaa')
+    refused = Daemon(cfg, state_root=state_root)
+    refused.start()
+    refused.stop()
+    assert (state_root / "startup_sweep_failed.json").is_file()
+
+    (state_root / "sessions.json").write_text(healthy_registry)
+    for _ in range(3):
+        clean = Daemon(cfg, state_root=state_root)
+        clean.start()
+        clean.stop()
+        assert not (state_root / "startup_sweep_failed.json").exists(), (
+            "a clean boot left the marker standing, so doctor fails forever")

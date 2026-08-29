@@ -36,6 +36,12 @@ is live":
 - The registry is empty while the workspace root is not. Every sid-shaped
   directory under it would be a stray, i.e. the sweep would delete
   everything -- which is never a legitimate outcome of an ordinary boot.
+- The registry SHRANK without the workspaces shrinking with it: the pass
+  would delete at least two directories AND more than half of every
+  sid-shaped directory present. See `_SHRINK_MIN_DOOMED` for the rule and
+  why it is a ratio rather than the boolean it replaces -- a boolean
+  emptiness test is disarmed by a single newly created session, which is
+  how 3 workspaces were destroyed two boots after one corrupt registry.
 
 `sweep` refuses the stray pass in both cases and reports why in
 `strays_refused`, so `Daemon.start()` can record it in the durable marker
@@ -191,27 +197,68 @@ def prune_dead_rows(registry: Registry) -> int:
     return removed
 
 
-def _workspace_root_has_sessions(cfg: Config) -> bool:
-    """Any sid-shaped directory under any kind directory of the workspace
-    root. Answers "is there anything here the sweep could delete?"."""
+# The shrink detector. `sweep_strays` deletes every sid-shaped directory no
+# registry row points at, so the number it would delete IS the blast radius,
+# and the registry shrinking without the directories shrinking with it is the
+# signature of a lost registry rather than of ordinary garbage.
+#
+# THE RULE: refuse the stray pass when the sweep would delete at least
+# `_SHRINK_MIN_DOOMED` directories AND more than half of all the sid-shaped
+# directories present.
+#
+# Why both halves, and why these numbers:
+#
+# - "More than half" is what makes it a SHRINK detector rather than an
+#   emptiness test. The guard this replaces asked `not registry.items()`,
+#   a boolean that one newly created session disarms: after a lost registry,
+#   1 row against 4 directories passed it and the sweep removed the other 3.
+#   A ratio cannot be disarmed that way -- 1 of 4 is still a shrink.
+# - "At least two" is what keeps ordinary operation working. Reaping a single
+#   stray is the common, legitimate case (a crashed create, a hand-deleted
+#   row) and it is never evidence of a lost registry, even when it is the only
+#   directory under a kind. Without this floor, 0-of-1 and 1-of-2 would refuse
+#   forever and strays would accumulate with nothing able to reclaim them.
+#
+# Worked through: 1 row / 4 dirs -> 3 doomed, 3 >= 2 and 3 > 2 -> REFUSED (the
+# reproduced data loss). 10 rows / 12 dirs -> 2 doomed, 2 > 6 is false ->
+# allowed. 1 row / 2 dirs -> 1 doomed, below the floor -> allowed.
+#
+# An empty registry facing ANY sid-shaped directory is still refused outright,
+# below, independently of this rule: there the sweep would delete everything,
+# which is never a legitimate outcome of an ordinary boot.
+_SHRINK_MIN_DOOMED = 2
+
+
+def _sid_dirs(cfg: Config) -> tuple[list[str], bool]:
+    """(names of every sid-shaped directory under the workspace root,
+    whether the scan was complete).
+
+    Answers both "is there anything here the sweep could delete?" and "how
+    much of it would go?". An unreadable directory makes the scan
+    incomplete; the caller treats "cannot tell" as "there is something", the
+    conservative reading in a deletion module.
+    """
+    names: list[str] = []
     root = paths.workspace_root(cfg)
     if not root.is_dir():
-        return False
+        return names, True
     try:
         kinds = list(root.iterdir())
     except OSError:
-        return True  # cannot tell -- assume there is, and refuse to delete
+        return names, False
+    complete = True
     for kind_dir in kinds:
         if not kind_dir.is_dir() or not paths.VALID_KIND_RE.match(kind_dir.name):
             continue
         try:
             children = list(kind_dir.iterdir())
         except OSError:
-            return True
+            complete = False
+            continue
         for child in children:
             if child.is_dir() and _SID_DIR_RE.match(child.name):
-                return True
-    return False
+                names.append(child.name)
+    return names, complete
 
 
 def sweep(cfg: Config, registry: Registry, *,
@@ -238,10 +285,20 @@ def sweep(cfg: Config, registry: Registry, *,
     if registry_status == UNREADABLE:
         refused = (f"{registry.sessions_file} exists but could not be parsed; "
                    f"the daemon cannot tell which workspaces are live")
-    elif not registry.items() and _workspace_root_has_sessions(cfg):
-        refused = (f"the registry is empty but {paths.workspace_root(cfg)} "
-                   f"still holds session directories; every one of them would "
-                   f"have been deleted as a stray")
+    else:
+        registered = {sid for sid, _ in registry.items()}
+        sid_dirs, scan_complete = _sid_dirs(cfg)
+        doomed = [name for name in sid_dirs if name not in registered]
+        if not registered and (sid_dirs or not scan_complete):
+            refused = (f"the registry is empty but {paths.workspace_root(cfg)} "
+                       f"still holds session directories; every one of them would "
+                       f"have been deleted as a stray")
+        elif len(doomed) >= _SHRINK_MIN_DOOMED and len(doomed) * 2 > len(sid_dirs):
+            refused = (f"the registry shrank without the workspaces shrinking "
+                       f"with it: {len(registered)} live registry row(s) against "
+                       f"{len(sid_dirs)} session directories under "
+                       f"{paths.workspace_root(cfg)}, so the stray pass would "
+                       f"have deleted {len(doomed)} of them")
 
     strays_removed = 0
     if refused is None:

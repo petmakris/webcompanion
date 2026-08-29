@@ -375,11 +375,17 @@ def run(argv: list[str]) -> int:
                   f"{failure.get('when')} -- {failure['refused']}")
             print(f"  nothing was deleted, which is the point. Fix the cause "
                   f"and restart; see {marker_path}")
-        else:
+        elif failure.get("error"):
             print(f"startup cleanup: FAILED at {failure.get('when')} -- "
                   f"{failure.get('error')}")
             print(f"  the daemon still started, but its startup cleanup sweep "
                   f"did not run; see {marker_path}")
+        preserved = failure.get("preserved_unreadable_registry")
+        if preserved:
+            print(f"registry: sessions.json could not be parsed and was "
+                  f"preserved as {preserved}")
+            print(f"  nothing was overwritten. Salvage it or delete it, then "
+                  f"restart; see {marker_path}")
 
     tail = _log_tail()
     if tail is None:

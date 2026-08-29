@@ -325,7 +325,7 @@ def test_persist_preserves_an_unreadable_sessions_file(tmp_path):
     reg.rehydrate()
     reg.persist()
 
-    saved = list(state.glob("sessions.json.corrupt-*"))
+    saved = list(state.glob("sessions.json.unreadable*"))
     assert len(saved) == 1
     assert saved[0].read_text() == '{"250101-120000-aaaa'
     assert json.loads((state / "sessions.json").read_text()) == {}

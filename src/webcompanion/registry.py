@@ -232,7 +232,7 @@ class Registry:
             return {}, UNREADABLE
         return parsed, LOADED
 
-    def persist(self) -> None:
+    def persist(self) -> Path | None:
         """Write this process's rows, merged with whatever else is on disk.
 
         NOT a wholesale rewrite from memory. This registry only ever knows
@@ -240,6 +240,12 @@ class Registry:
         added in the meantime (a `migrate --apply` run, most of all) is
         still live, and dropping it here deletes its workspace on the next
         startup sweep. So: take the file lock, re-read, union, write.
+
+        Returns the path an UNREADABLE `sessions.json` was preserved to, or
+        None. The caller (`Daemon.start`) records that path in the durable
+        marker `doctor` reads: a registry that could not be understood is a
+        state a human has to be told about, not one the daemon quietly
+        papers over.
         """
         self._state_root.mkdir(parents=True, exist_ok=True)
         with self._cross_process_lock():
@@ -250,12 +256,17 @@ class Registry:
                 }
                 meta_snapshot = {sid: dict(m) for sid, m in self._meta.items()}
 
+            preserved: Path | None = None
             on_disk, status = self._read_file(self.sessions_file)
             if status == UNREADABLE:
                 # Never overwrite an unreadable registry in place: it is the
                 # only record of which workspaces are live, and a human may
-                # be able to salvage it. Move it aside first, once.
-                self._preserve_unreadable()
+                # be able to salvage it. Rename it aside FIRST, so the bytes
+                # this process could not parse survive at a path a human can
+                # find, and only then write a fresh registry so the daemon
+                # can move on. Same rule `ensure_config()` applies to a
+                # config.json it cannot read (`install_service.ensure_config`).
+                preserved = self._preserve_unreadable()
             elif status == LOADED:
                 for sid, dirs in on_disk.items():
                     if sid in snapshot or not VALID_SID_RE.match(str(sid)):
@@ -273,17 +284,35 @@ class Registry:
             write_text_atomic(self.sessions_file, json.dumps(snapshot, indent=2))
             write_text_atomic(self.sessions_meta_file,
                               json.dumps(meta_snapshot, indent=2))
+            return preserved
 
-    def _preserve_unreadable(self) -> None:
+    #: Where an unreadable `sessions.json` is renamed to. A FIXED name, so
+    #: `doctor` and a human can both name the file without knowing when the
+    #: corruption happened.
+    UNREADABLE_SUFFIX = ".unreadable"
+
+    def _preserve_unreadable(self) -> Path | None:
         """Rename an unreadable `sessions.json` aside instead of clobbering
-        it. Best-effort: failing to preserve it must not stop the daemon
-        from writing a usable registry."""
+        it, and return where it went.
+
+        Renames to `sessions.json.unreadable` once. If that name is already
+        taken -- a SECOND corruption after an earlier one was preserved and
+        never cleaned up -- a timestamp is appended rather than overwriting
+        the first copy: preserving a file only to destroy the previous
+        preserved copy would defeat the point.
+
+        Best-effort: failing to preserve it must not stop the daemon from
+        writing a usable registry.
+        """
         dest = self.sessions_file.with_name(
-            f"{self.sessions_file.name}.corrupt-{int(time.time())}")
+            self.sessions_file.name + self.UNREADABLE_SUFFIX)
+        if dest.exists():
+            dest = dest.with_name(f"{dest.name}-{int(time.time())}")
         try:
             os.replace(self.sessions_file, dest)
         except OSError:
-            pass
+            return None
+        return dest
 
     def rehydrate(self) -> str:
         """Restore rows whose directories still exist, and report what

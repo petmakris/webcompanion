@@ -270,3 +270,74 @@ def test_a_genuine_stray_beside_a_live_session_is_still_reclaimed(tmp_path):
     assert summary["strays_refused"] is None
     assert summary["strays_removed"] == 1
     assert not orphan.exists()
+
+
+def test_the_stray_pass_is_refused_when_the_registry_shrank_under_the_workspaces(
+        tmp_path):
+    """The guard this replaces was `not registry.items()`, a boolean, so one
+    newly created session disarmed it: after a lost registry, 1 row against
+    4 directories passed and the sweep deleted the other 3.
+
+    The exact shape that destroyed data: 1 live row, 4 sid-shaped
+    directories. The refusal must NAME the counts -- the message is what a
+    user has to act on.
+    """
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")
+    live = "251231-000000-0123456789abcdef"
+    reg.create("annotate", live, paths.make_session_dirs(cfg, "annotate", live),
+               {"title": "live"}, str(tmp_path))
+    orphans = [paths.kind_root(cfg, "annotate") / f"251231-000000-cafebabecafeba0{i}"
+               for i in range(3)]
+    for orphan in orphans:
+        orphan.mkdir(parents=True)
+
+    summary = cleanup.sweep(cfg, reg)
+
+    assert summary["strays_removed"] == 0
+    assert all(orphan.is_dir() for orphan in orphans)
+    assert "1 live registry row" in summary["strays_refused"]
+    assert "4 session directories" in summary["strays_refused"]
+    assert "deleted 3 of them" in summary["strays_refused"]
+
+
+def test_ordinary_garbage_collection_still_reaps_a_stray_or_two(tmp_path):
+    """The negative control for the shrink detector. Refusing a drastic
+    shrink must not turn into refusing routine cleanup: 10 live rows against
+    12 directories is 2 strays, and they have to go."""
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")
+    for i in range(10):
+        sid = f"251231-000000-000000000000000{i}"
+        reg.create("deck", sid, paths.make_session_dirs(cfg, "deck", sid),
+                   {"title": f"live {i}"}, str(tmp_path))
+    orphans = [paths.kind_root(cfg, "deck") / f"251231-000000-cafebabecafeba0{i}"
+               for i in range(2)]
+    for orphan in orphans:
+        orphan.mkdir(parents=True)
+
+    summary = cleanup.sweep(cfg, reg)
+
+    assert summary["strays_refused"] is None
+    assert summary["strays_removed"] == 2
+    assert not any(orphan.exists() for orphan in orphans)
+
+
+def test_a_lone_stray_under_a_kind_is_still_reaped(tmp_path):
+    """The floor in the shrink rule, asserted. One live row and one stray is
+    100% of the directories the sweep would delete being strays, which the
+    ratio alone would refuse -- and then a single stray could never be
+    reclaimed by anything."""
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")
+    live = "251231-000000-0123456789abcdef"
+    reg.create("deck", live, paths.make_session_dirs(cfg, "deck", live),
+               {"title": "live"}, str(tmp_path))
+    orphan = paths.kind_root(cfg, "annotate") / "251231-000000-cafebabecafebabe"
+    orphan.mkdir(parents=True)
+
+    summary = cleanup.sweep(cfg, reg)
+
+    assert summary["strays_refused"] is None
+    assert summary["strays_removed"] == 1
+    assert not orphan.exists()

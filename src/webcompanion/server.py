@@ -197,6 +197,23 @@ class Daemon:
         except OSError:
             pass
 
+    def _clear_sweep_problem(self) -> None:
+        """Remove the marker after a boot whose sweep ran clean.
+
+        The marker is durable ON PURPOSE, but durable is not permanent: it
+        described one boot, and `doctor` exits 1 while it exists. Left
+        forever, one refused boot makes `doctor` fail on every healthy
+        machine after it, and its own advice -- "fix the cause and restart"
+        -- is then advice that cannot work, because restarting is exactly
+        what does not clear it. A boot that rehydrated its registry, swept
+        without refusing, and preserved nothing has demonstrated the cause
+        is gone; that is the only thing allowed to clear it.
+        """
+        try:
+            (self.state_root / SWEEP_MARKER).unlink()
+        except OSError:
+            pass
+
     def start(self) -> None:
         # The status matters as much as the rows: an unreadable sessions.json
         # must not read as "no sessions exist", because the stray sweep
@@ -208,6 +225,7 @@ class Daemon:
         # skill seeing connection refused and nothing saying why. A daemon
         # that skips a sweep is strictly better than one that refuses to
         # start.
+        problem: dict = {}
         try:
             result = cleanup.sweep(self.cfg, self.registry,
                                    registry_status=registry_status)
@@ -215,13 +233,26 @@ class Daemon:
             print("webcompanion: startup cleanup sweep failed, continuing:",
                   file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
-            self._record_sweep_problem(error=f"{type(exc).__name__}: {exc}")
+            problem["error"] = f"{type(exc).__name__}: {exc}"
         else:
             if result.get("strays_refused"):
                 print(f"webcompanion: refused the startup stray sweep: "
                       f"{result['strays_refused']}", file=sys.stderr)
-                self._record_sweep_problem(refused=result["strays_refused"])
-        self.registry.persist()
+                problem["refused"] = result["strays_refused"]
+        # persist() reports whether it had to move an unreadable
+        # sessions.json aside. That is a data-loss-adjacent event a human has
+        # to be told about, so it goes in the same durable marker -- and it
+        # keeps the marker standing on a boot where the sweep itself was
+        # clean but the registry was not.
+        preserved = self.registry.persist()
+        if preserved is not None:
+            print(f"webcompanion: {self.registry.sessions_file} could not be "
+                  f"parsed; preserved it as {preserved}", file=sys.stderr)
+            problem["preserved_unreadable_registry"] = str(preserved)
+        if problem:
+            self._record_sweep_problem(**problem)
+        else:
+            self._clear_sweep_problem()
         handler = _make_handler(self)
         self._httpd = ThreadingHTTPServer((self.cfg.bind, self.cfg.port), handler)
         self._httpd.daemon_threads = True
