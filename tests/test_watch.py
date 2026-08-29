@@ -67,9 +67,13 @@ def test_terminal_state_reads_marker_files_not_memory(tmp_path):
 def test_a_reaped_workspace_ends_the_watch_without_spinning(tmp_path):
     # state_dir is never created -- simulates retention or the stray sweep
     # having removed the workspace out from under a still-running watch.
+    # events_dir and consumed_dir sit INSIDE state_dir, exactly as
+    # paths._SUBDIRS lays them out: putting them elsewhere would have hidden
+    # that watch_loop used to mkdir state_dir back into existence and never
+    # reach this banner at all.
     state_dir = tmp_path / "gone" / "state"
-    events_dir = tmp_path / "events"
-    consumed_dir = tmp_path / "consumed"
+    events_dir = state_dir / "events"
+    consumed_dir = state_dir / "consumed"
     buf = io.StringIO()
 
     rc = run_with_hard_timeout(

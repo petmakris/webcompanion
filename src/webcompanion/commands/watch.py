@@ -30,6 +30,13 @@ this replaces, and all of it survives the port:
   * A reaped workspace (its `state_dir` gone -- retention or a stray sweep
     got to it) ends the watch with `WEBCOMPANION_CANCELLED` rather than
     spinning forever writing heartbeats into a void.
+  * The session's directories are RESOLVED from the registry, never created.
+    `paths.make_session_dirs` mkdirs, so calling it here meant `watch --sid
+    <typo>` silently built a six-directory workspace and then blocked
+    forever printing nothing -- and a watch started after a workspace was
+    reaped recreated `state_dir`, which is the one condition the
+    WEBCOMPANION_CANCELLED banner above tests for. An unknown sid must fail
+    loudly instead.
 
 `watch` never talks to the daemon over HTTP for any of this: the queue and
 the terminal markers are files in the session's own `state_dir`, computed
@@ -48,9 +55,9 @@ import sys
 import time
 from pathlib import Path
 
-from webcompanion import config as cfgmod
 from webcompanion import paths
 from webcompanion.commands._common import client_from_config, preflight
+from webcompanion.registry import Registry
 
 FINISHED_MARKER = "finished"
 CANCELLED_MARKER = "cancelled"
@@ -128,8 +135,13 @@ def watch_loop(kind: str, sid: str, state_dir, events_dir, consumed_dir, *,
     state_dir = Path(state_dir)
     events_dir = Path(events_dir)
     consumed_dir = Path(consumed_dir)
-    events_dir.mkdir(parents=True, exist_ok=True)
-    consumed_dir.mkdir(parents=True, exist_ok=True)
+    # Only if the workspace is still there. Both of these live INSIDE
+    # state_dir, so creating them unconditionally recreates a state_dir that
+    # retention or the stray sweep just removed -- and the reap check at the
+    # top of the loop would then never fire.
+    if state_dir.is_dir():
+        events_dir.mkdir(parents=True, exist_ok=True)
+        consumed_dir.mkdir(parents=True, exist_ok=True)
 
     ack_iterations = max(1, int(round(ack_timeout_seconds / poll_seconds)))
 
@@ -207,6 +219,29 @@ def watch_loop(kind: str, sid: str, state_dir, events_dir, consumed_dir, *,
     return 0
 
 
+class UnknownSession(Exception):
+    """No registry row matches this kind and sid (or slug)."""
+
+
+def resolve_session_dirs(kind: str, sid: str) -> dict:
+    """The directories the daemon actually created for this session.
+
+    Reads the daemon's own registry file rather than recomputing a path from
+    `Config` -- recomputing cannot tell an existing session from a typo, and
+    the function that recomputes (`paths.make_session_dirs`) creates what it
+    is asked about. Raises `UnknownSession` when nothing matches.
+    """
+    registry = Registry(paths.state_root())
+    registry.rehydrate()
+    resolved = registry.resolve(sid, kind=kind)
+    if resolved is None:
+        raise UnknownSession(sid)
+    dirs = registry.lookup(resolved)
+    if dirs is None:
+        raise UnknownSession(sid)
+    return dirs
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="webcompanion watch")
     p.add_argument("--kind", required=True)
@@ -223,8 +258,15 @@ def run(argv: list[str]) -> int:
     if rc is not None:
         return rc
 
-    cfg = cfgmod.load()
-    dirs = paths.make_session_dirs(cfg, args.kind, args.sid)
+    try:
+        dirs = resolve_session_dirs(args.kind, args.sid)
+    except UnknownSession:
+        print(f"webcompanion watch: no such session: kind={args.kind} "
+              f"sid={args.sid}\n"
+              f"  the daemon has no registered session by that id or slug; "
+              f"watch never creates one.\n"
+              f"  list what exists:  webcompanion status", file=sys.stderr)
+        return 1
     return watch_loop(args.kind, args.sid, dirs["state_dir"],
                        dirs["events_dir"], dirs["consumed_dir"],
                        max_emits=args.max_emits)
