@@ -68,6 +68,42 @@ def _is_marked(state_dir: Path, name: str) -> bool:
     return (Path(state_dir) / name).exists()
 
 
+# Registered renderer roots are a FILE in the session's workspace, not
+# daemon memory -- the same fix Task 10 applied to finished/cancelled, for
+# the same reason. This daemon restarts on every package upgrade; a dict
+# here would 404 every open browser tab's stylesheet and script right after
+# an upgrade, with no visible cause. No in-memory cache is kept alongside
+# it either: a cache and the disk state can disagree after a restart, and
+# the cache would silently win.
+_ASSETS_MARKER = "assets.json"
+
+
+def _write_asset_root(base: Path, static_root: str, entry: str | None) -> None:
+    write_text_atomic(Path(base) / _ASSETS_MARKER,
+                       json.dumps({"static_root": static_root, "entry": entry}))
+
+
+def _read_asset_root(base: Path) -> dict | None:
+    """The registered {static_root, entry} for this session, or None.
+
+    Re-validates static_root is still an existing directory on every call --
+    a persisted value can point at a directory since deleted or replaced,
+    and a stale registration must read as "nothing registered", never raise
+    inside the request handler.
+    """
+    try:
+        raw = json.loads((Path(base) / _ASSETS_MARKER).read_text())
+    except (OSError, json.JSONDecodeError):
+        return None
+    if not isinstance(raw, dict):
+        return None
+    static_root = raw.get("static_root")
+    if not isinstance(static_root, str) or not Path(static_root).is_dir():
+        return None
+    entry = raw.get("entry")
+    return {"root": static_root, "entry": entry if isinstance(entry, str) else None}
+
+
 def _editor_command(target: Path, line: int | None) -> list[str]:
     """Ported from skills/_shared/web_companion/server.py:897 unchanged: an
     IDE launcher wins when present (and takes a line number), otherwise the
@@ -94,12 +130,6 @@ class Daemon:
         # not server memory (see the module docstring below this class).
         self._flags: dict[str, dict] = {}
         self._flags_lock = threading.Lock()
-        # A registered renderer root, per session. Not persisted: it is the
-        # client re-announcing "here is my static bundle" on every session
-        # it opens, so losing it on a restart just means the next page load
-        # re-registers it -- same shape as watcher_seen_at above.
-        self._assets: dict[str, dict] = {}
-        self._assets_lock = threading.Lock()
 
     @property
     def url(self) -> str:
@@ -141,15 +171,6 @@ class Daemon:
         with self._flags_lock:
             return dict(self._flags.get(sid, self._DEFAULT_FLAGS))
 
-    # ── registered renderer roots ────────────────────────────────────────
-    def set_asset_root(self, sid: str, root: str, entry: str | None) -> None:
-        with self._assets_lock:
-            self._assets[sid] = {"root": root, "entry": entry}
-
-    def get_asset_root(self, sid: str) -> dict | None:
-        with self._assets_lock:
-            info = self._assets.get(sid)
-            return dict(info) if info is not None else None
 
 
 def _make_handler(daemon: Daemon):
@@ -273,13 +294,13 @@ def _make_handler(daemon: Daemon):
                 resolved, dirs = self._session(m.group(1))
                 if resolved is None:
                     return
-                return self._get_asset(resolved, unquote(m.group(2)))
+                return self._get_asset(dirs, unquote(m.group(2)))
             m = _SID_ROOT_RE.match(path)
             if m:
                 resolved, dirs = self._session(m.group(1))
                 if resolved is None:
                     return
-                return self._get_shell(resolved)
+                return self._get_shell(dirs)
             self._text(404, "not found")
 
         def do_POST(self):
@@ -301,7 +322,7 @@ def _make_handler(daemon: Daemon):
                 resolved, dirs = self._session(m.group(1))
                 if resolved is None:
                     return
-                return self._register_assets(resolved)
+                return self._register_assets(dirs)
             m = _SID_UPLOAD_RE.match(path)
             if m:
                 resolved, dirs = self._session(m.group(1))
@@ -509,7 +530,7 @@ def _make_handler(daemon: Daemon):
             self._json(200, {"ok": True})
 
         # ── assets and the page ────────────────────────────────────────────
-        def _register_assets(self, sid: str) -> None:
+        def _register_assets(self, dirs: dict) -> None:
             if not self._require_owner():
                 return
             payload = self._body()
@@ -528,11 +549,20 @@ def _make_handler(daemon: Daemon):
                 return
             entry = payload.get("entry")
             entry = entry if isinstance(entry, str) and entry else None
-            daemon.set_asset_root(sid, str(root), entry)
+            # Persisted to the session's own workspace, not daemon memory:
+            # this is an always-on service restarted on every package
+            # upgrade, and a dict here would 404 every open tab's stylesheet
+            # and script right after one, same as Task 10's finished/
+            # cancelled fix. No in-memory cache is kept beside it either --
+            # after a restart a cache and the disk state can disagree, and
+            # the cache would silently win.
+            _write_asset_root(paths.base_of(dirs), str(root), entry)
             self._json(200, {"ok": True})
 
-        def _get_asset(self, sid: str, relpath: str) -> None:
-            info = daemon.get_asset_root(sid)
+        def _get_asset(self, dirs: dict, relpath: str) -> None:
+            # Re-read (and re-validate) from disk on every request, never
+            # from a cache -- see the comment in _register_assets.
+            info = _read_asset_root(paths.base_of(dirs))
             if info is None:
                 self._text(404, "no renderer registered for this session")
                 return
@@ -540,7 +570,10 @@ def _make_handler(daemon: Daemon):
             try:
                 # resolve() follows symlinks BEFORE the containment test --
                 # a link inside the bundle pointing out of it must not
-                # smuggle a file through.
+                # smuggle a file through. The root itself is re-read from
+                # disk above, so this check runs against the CURRENT value,
+                # never one trusted safe merely because it validated once at
+                # registration time.
                 target = (root / relpath).resolve()
             except (OSError, ValueError):
                 self._text(403, "forbidden")
@@ -553,12 +586,12 @@ def _make_handler(daemon: Daemon):
                 return
             self._serve_file(target)
 
-        def _get_shell(self, sid: str) -> None:
+        def _get_shell(self, dirs: dict) -> None:
             # A minimal placeholder shell. Task 13 replaces this with the
             # packaged shell.html template; the only property this task owns
             # is that a session always gets SOME page back, and that it names
             # the daemon's runtime and (when registered) the renderer entry.
-            info = daemon.get_asset_root(sid)
+            info = _read_asset_root(paths.base_of(dirs))
             entry_tag = ""
             if info and info.get("entry"):
                 entry_tag = ('<script type="module" src="assets/%s"></script>'
