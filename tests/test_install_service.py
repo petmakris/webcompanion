@@ -128,3 +128,89 @@ def test_install_service_run_fails_loudly_on_a_corrupt_config_without_touching_i
     assert str(p) in err
     assert not (tmp_path / "throwaway").exists() or not any(
         (tmp_path / "throwaway").iterdir()), "must not write a plist/unit over a corrupt config"
+
+
+# ── the service is addressed by the name that was written, and failure is
+#    reported ─────────────────────────────────────────────────────────────
+#
+# Every test below fakes subprocess.run, so no real service is ever
+# registered, unregistered, or restarted.
+
+def _record_commands(monkeypatch, returncode=0, stderr=""):
+    calls = []
+
+    def fake_run(cmd, **kwargs):
+        calls.append(list(cmd))
+
+        class Result:
+            pass
+        r = Result()
+        r.returncode = returncode
+        r.stdout = ""
+        r.stderr = stderr
+        return r
+
+    monkeypatch.setattr(svc.subprocess, "run", fake_run)
+    return calls
+
+
+def test_the_systemd_calls_name_the_unit_file_that_was_written(tmp_path, monkeypatch):
+    """install-service wrote `webcompanion.service` and then ran systemctl
+    against `dev.webcompanion`, the launchd label. Every call named a unit
+    that does not exist, so a Linux install started nothing."""
+    calls = _record_commands(monkeypatch)
+    unit_path = tmp_path / svc.DEFAULT_SERVICE_NAME
+
+    problems = svc._load_and_restart("linux", unit_path, svc.DEFAULT_LABEL)
+
+    assert problems == []
+    named = [c[-1] for c in calls if c[-1] != "daemon-reload"]
+    assert named and all(n == svc.DEFAULT_SERVICE_NAME for n in named), calls
+    assert svc.DEFAULT_LABEL not in [tok for c in calls for tok in c]
+
+
+def test_a_failed_systemctl_call_is_reported_not_swallowed(tmp_path, monkeypatch):
+    """Every call was check=False, capture_output=True with the result
+    discarded, so `installed ... and restarted` printed no matter what."""
+    _record_commands(monkeypatch, returncode=5,
+                     stderr="Failed to enable unit: does not exist")
+
+    problems = svc._load_and_restart(
+        "linux", tmp_path / svc.DEFAULT_SERVICE_NAME, svc.DEFAULT_LABEL)
+
+    assert len(problems) == 3
+    assert all("exited 5" in p for p in problems)
+    assert any("does not exist" in p for p in problems)
+
+
+def test_a_first_install_tolerates_only_the_launchd_bootout(tmp_path, monkeypatch):
+    """`launchctl bootout` fails when nothing is loaded yet -- the normal
+    first install. It is the one step allowed to fail; bootstrap and
+    kickstart are not."""
+    _record_commands(monkeypatch, returncode=1)
+
+    problems = svc._load_and_restart(
+        "darwin", tmp_path / "dev.webcompanion.plist", svc.DEFAULT_LABEL)
+
+    assert len(problems) == 2
+    assert not any("bootout" in p for p in problems)
+    assert any("bootstrap" in p for p in problems)
+    assert any("kickstart" in p for p in problems)
+
+
+def test_run_returns_nonzero_and_says_so_when_the_service_would_not_start(
+        tmp_path, monkeypatch, capsys):
+    """The user-visible half: a failed start must not print success."""
+    monkeypatch.setattr(cfgmod, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setattr(svc, "build_zipapp", lambda dest: tmp_path / "w.pyz")
+    monkeypatch.setattr(svc, "default_plist_path",
+                        lambda label=svc.DEFAULT_LABEL: tmp_path / f"{label}.plist")
+    monkeypatch.setattr(svc, "default_unit_path",
+                        lambda name=svc.DEFAULT_SERVICE_NAME: tmp_path / name)
+    monkeypatch.setattr(svc, "_load_and_restart",
+                        lambda system, unit_path, label: ["`systemctl ...` exited 5"])
+
+    assert svc.run([]) == 1
+    err = capsys.readouterr().err
+    assert "could not start" in err
+    assert "exited 5" in err

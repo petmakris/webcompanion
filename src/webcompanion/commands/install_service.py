@@ -151,30 +151,62 @@ def ensure_config() -> Config:
     return cfg
 
 
-def _load_and_restart(system: str, unit_path: Path, label: str) -> None:
+def _run_step(cmd: list[str]) -> tuple[int, str]:
+    """Run one service-management command and return (rc, stderr).
+
+    Output is captured rather than inherited so a `launchctl bootout` on a
+    service that was not loaded does not print a scary line during an
+    ordinary first install -- but the return code is RETURNED, never
+    dropped. Swallowing it is what let install-service report success while
+    having started nothing at all.
+    """
+    try:
+        proc = subprocess.run(cmd, check=False, capture_output=True, text=True)
+    except OSError as e:
+        return 127, f"could not run {cmd[0]}: {e}"
+    return proc.returncode, (proc.stderr or "").strip()
+
+
+def _load_and_restart(system: str, unit_path: Path, label: str) -> list[str]:
     """Load (or reload) the service and restart it. This is the final step
     of install-service, so an upgrade takes effect immediately instead of
     leaving the old code running.
 
+    Returns one message per step that failed, for `run()` to report. An
+    empty list means every step succeeded.
+
     Never called against a throwaway `target_dir` -- see `run()` and the
     task's HARD LIMIT on registering a real background service from here.
     """
+    problems: list[str] = []
+
+    def step(cmd: list[str], *, tolerate_failure: bool = False) -> None:
+        rc, err = _run_step(cmd)
+        if rc != 0 and not tolerate_failure:
+            problems.append(f"`{' '.join(cmd)}` exited {rc}"
+                            + (f": {err}" if err else ""))
+
     if system == "darwin":
         uid = os.getuid()
         domain = f"gui/{uid}"
-        subprocess.run(["launchctl", "bootout", domain, str(unit_path)],
-                        check=False, capture_output=True)
-        subprocess.run(["launchctl", "bootstrap", domain, str(unit_path)],
-                        check=False, capture_output=True)
-        subprocess.run(["launchctl", "kickstart", "-k", f"{domain}/{label}"],
-                        check=False, capture_output=True)
+        # bootout fails when nothing is loaded yet, which is the normal
+        # first install -- the only step here allowed to fail.
+        step(["launchctl", "bootout", domain, str(unit_path)],
+             tolerate_failure=True)
+        step(["launchctl", "bootstrap", domain, str(unit_path)])
+        step(["launchctl", "kickstart", "-k", f"{domain}/{label}"])
     else:
-        subprocess.run(["systemctl", "--user", "daemon-reload"],
-                        check=False, capture_output=True)
-        subprocess.run(["systemctl", "--user", "enable", "--now", label],
-                        check=False, capture_output=True)
-        subprocess.run(["systemctl", "--user", "restart", label],
-                        check=False, capture_output=True)
+        # systemd addresses the unit by the FILENAME that was written
+        # (webcompanion.service), never by the launchd label
+        # (dev.webcompanion). Using the label here meant every systemctl
+        # call named a unit that does not exist, all three failures were
+        # swallowed, and the success line printed anyway -- so a Linux
+        # install-service never started anything and said it had.
+        unit_name = unit_path.name
+        step(["systemctl", "--user", "daemon-reload"])
+        step(["systemctl", "--user", "enable", "--now", unit_name])
+        step(["systemctl", "--user", "restart", unit_name])
+    return problems
 
 
 def run(argv: list[str], *, target_dir: Path | None = None,
@@ -212,9 +244,20 @@ def run(argv: list[str], *, target_dir: Path | None = None,
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(render_unit(pyz=pyz, log_dir=log_dir))
 
-    if target_dir is None:
-        _load_and_restart(system, dest, label)
-        print(f"webcompanion: installed {dest} and restarted {label}")
-    else:
+    if target_dir is not None:
         print(f"webcompanion: wrote {dest} (throwaway install -- not loaded)")
+        return 0
+
+    problems = _load_and_restart(system, dest, label)
+    if problems:
+        service = label if system == "darwin" else dest.name
+        print(f"webcompanion: wrote {dest}, but could not start {service}:",
+              file=sys.stderr)
+        for problem in problems:
+            print(f"  {problem}", file=sys.stderr)
+        print(f"  run `webcompanion doctor` for the fuller diagnosis.",
+              file=sys.stderr)
+        return 1
+    print(f"webcompanion: installed {dest} and restarted "
+          f"{label if system == 'darwin' else dest.name}")
     return 0
