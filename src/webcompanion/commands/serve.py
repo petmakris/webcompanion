@@ -53,16 +53,26 @@ def port_holder(port: int) -> tuple[str, int] | None:
 def _port_is_free(bind: str, port: int) -> bool:
     """A plain bind with no SO_REUSEADDR: the one check that actually
     detects a listener already on this port, which `Daemon.start()` (via
-    `ThreadingHTTPServer`'s `SO_REUSEADDR`) would not."""
-    s = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    `ThreadingHTTPServer`'s `SO_REUSEADDR`) would not.
+
+    The family comes from `bind` itself. Hardcoding AF_INET meant a
+    configured `bind = "::1"` could never bind here, so this check refused
+    the port permanently and the daemon never started -- on an address
+    gate.py went to real trouble to support.
+    """
     try:
-        s.bind((bind, port))
-    except OSError:
-        return False
-    else:
-        return True
-    finally:
-        s.close()
+        infos = socket.getaddrinfo(bind, port, type=socket.SOCK_STREAM)
+    except socket.gaierror:
+        return False  # an address that does not resolve is not one we can use
+    for family, socktype, proto, _canon, sockaddr in infos:
+        s = socket.socket(family, socktype, proto)
+        try:
+            s.bind(sockaddr)
+        except OSError:
+            return False
+        finally:
+            s.close()
+    return True
 
 
 def _pidfile_path() -> Path:
@@ -97,6 +107,9 @@ def run(argv: list[str], *, _stop_event: threading.Event | None = None) -> int:
             print(f"webcompanion: port {cfg.port} is already in use "
                   f"(holder could not be determined); refusing to bind "
                   f"alongside a stale process.", file=sys.stderr)
+        print(f"  change it with the \"port\" field in "
+              f"{cfgmod.config_path()} (see the README's Configuration "
+              f"section), then restart the service.", file=sys.stderr)
         return 1
 
     daemon = Daemon(cfg)

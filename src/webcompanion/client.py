@@ -125,39 +125,3 @@ class Client:
 
     def cancel(self, sid: str) -> None:
         self._request("POST", f"/s/{sid}/api/cancel")
-
-    def events(self, sid: str) -> list[dict]:
-        """Pending (un-acked) events queued for `sid`, oldest first.
-
-        There is no HTTP route for this -- the daemon never exposed one,
-        because the only consumer, `watch`, runs on the same host as the
-        daemon and reads the queue directly off disk the way `watcher.sh`
-        always did (atomic-rename heartbeats and ack files are filesystem
-        operations with no HTTP equivalent). This method exists for the
-        rest of the `Client` interface and for callers that just want to
-        inspect the queue, resolving `sid` through the daemon's own
-        session registry file rather than duplicating its layout rules.
-        """
-        from webcompanion import paths
-
-        sessions_file = paths.state_root() / "sessions.json"
-        try:
-            snapshot = json.loads(sessions_file.read_text())
-        except (OSError, json.JSONDecodeError):
-            return []
-        dirs = snapshot.get(sid)
-        if not isinstance(dirs, dict) or "events_dir" not in dirs:
-            return []
-        events_dir = Path(dirs["events_dir"])
-        consumed_dir = Path(dirs.get("consumed_dir", ""))
-        out = []
-        for p in sorted(events_dir.glob("*.json")):
-            event_id = p.stem
-            if consumed_dir and (consumed_dir / f"{event_id}.ack").exists():
-                continue
-            try:
-                payload = json.loads(p.read_text())
-            except (OSError, json.JSONDecodeError):
-                continue
-            out.append({"event_id": event_id, "payload": payload})
-        return out

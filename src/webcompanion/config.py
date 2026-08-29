@@ -31,7 +31,6 @@ class Config:
     bind: str = DEFAULT_BIND
     retention_days: int | None = None
     workspace_root: Path | None = None
-    public_host: str | None = None
 
 
 def config_path() -> Path:
@@ -77,7 +76,6 @@ def load(path: Path | None = None) -> Config:
         bind=_str("bind", DEFAULT_BIND),
         retention_days=_int("retention_days", None) if raw.get("retention_days") is not None else None,
         workspace_root=ws,
-        public_host=_str("public_host", None) or None,
     )
 
 
@@ -95,7 +93,6 @@ def write(cfg: Config, path: Path | None = None) -> None:
         "bind": cfg.bind,
         "retention_days": cfg.retention_days,
         "workspace_root": str(cfg.workspace_root) if cfg.workspace_root else None,
-        "public_host": cfg.public_host,
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="config.", suffix=".tmp")
     try:

@@ -119,6 +119,19 @@ class Registry:
             ]
         return matches[0] if len(matches) == 1 else None
 
+    def kinds_for_slug(self, key: str) -> list[str]:
+        """Every kind in which `key` is a live slug, sorted.
+
+        Exists so an ambiguous slug can be answered with the list of kinds
+        it matches rather than a bare 404 -- see server._session. Returns []
+        for a sid or for a slug nothing uses.
+        """
+        with self._lock:
+            return sorted({
+                str(m.get("kind") or "") for sid, m in self._meta.items()
+                if m.get("slug") == key and sid in self._sessions
+            } - {""})
+
     def get_meta(self, sid: str) -> dict:
         with self._lock:
             return dict(self._meta.get(sid, {}))

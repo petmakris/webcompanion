@@ -309,11 +309,28 @@ def _make_handler(daemon: Daemon):
             return ok
 
         def _session(self, sid: str):
-            resolved = daemon.registry.resolve(sid)
-            if resolved is None:
+            """Resolve a sid or slug, honouring `?kind=` when given.
+
+            A slug is unique within a kind, not across them, and three kinds
+            sharing one slug is real in practice. `resolve` answers None for
+            an ambiguous slug, which used to surface as `404 no such
+            session` -- a status that reads as "it is gone" for something
+            that very much exists, three times over. `?kind=` picks one, and
+            a still-ambiguous slug is a 409 that NAMES the candidates so the
+            caller can retry without guessing.
+            """
+            kind = (parse_qs(urlsplit(self.path).query).get("kind") or [None])[0]
+            resolved = daemon.registry.resolve(sid, kind=kind)
+            if resolved is not None:
+                return resolved, daemon.registry.lookup(resolved)
+            kinds = daemon.registry.kinds_for_slug(sid)
+            if len(kinds) > 1:
+                self._text(409, "the slug %r exists in more than one kind (%s); "
+                                "add ?kind=<kind> to say which"
+                                % (sid, ", ".join(kinds)))
+            else:
                 self._text(404, "no such session")
-                return None, None
-            return resolved, daemon.registry.lookup(resolved)
+            return None, None
 
         def _row(self, sid: str) -> dict:
             meta = daemon.registry.get_meta(sid)
@@ -578,10 +595,17 @@ def _make_handler(daemon: Daemon):
                 return
             versions = items.versions_of(dirs["items_dir"])
             out = {"body": body, "version": versions.get(anchor, 1)}
+            # A row with no _cwd cannot resolve code anchors -- and reaching
+            # for the key anyway raised KeyError inside the handler, i.e. a
+            # 500 with a traceback for what is a malformed session row.
+            cwd = dirs.get("_cwd")
+            if not str(cwd or "").strip():
+                self._text(400, "this session has no workspace root recorded")
+                return
             # Resolved HERE, not at push time. The client edits its repository
             # while the session is open; an anchor captured at push is wrong
             # within a turn.
-            resolved = anchors.resolve_all(body, Path(dirs["_cwd"]))
+            resolved = anchors.resolve_all(body, Path(cwd))
             if resolved:
                 out["code"] = resolved
             self._json(200, out)

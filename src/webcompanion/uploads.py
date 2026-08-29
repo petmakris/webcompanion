@@ -6,6 +6,7 @@ The endpoint is unchanged: POST <session>/api/upload with a raw image body
 from __future__ import annotations
 
 import json
+import socket
 import uuid
 from pathlib import Path
 from http.server import BaseHTTPRequestHandler
@@ -18,6 +19,14 @@ UPLOAD_EXT = {
     "image/webp": "webp",
 }
 UPLOAD_MAX_BYTES = 10 * 1024 * 1024
+
+# How long the whole body may take to arrive. A client is free to declare
+# 10 MB in Content-Length and then send one byte; `rfile.read(length)` blocks
+# until it gets all of it, so with no timeout that client parks a daemon
+# thread forever -- and every connected tab and IDE client already holds one
+# for the life of its stream. Generous enough for a real paste over
+# loopback, finite either way.
+UPLOAD_TIMEOUT_SECONDS = 30
 
 
 def handle(handler: BaseHTTPRequestHandler, dirs: dict) -> None:
@@ -38,7 +47,10 @@ def handle(handler: BaseHTTPRequestHandler, dirs: dict) -> None:
     if length <= 0 or length > UPLOAD_MAX_BYTES:
         _send_text(handler, 413, "payload too large")
         return
-    body = handler.rfile.read(length)
+    body = _read_body(handler, length)
+    if body is None:
+        _send_text(handler, 408, "request body timed out")
+        return
     images_dir = Path(dirs["state_dir"]) / "images"
     images_dir.mkdir(parents=True, exist_ok=True)
     path = images_dir / f"{uuid.uuid4().hex}.{ext}"
@@ -50,6 +62,34 @@ def handle(handler: BaseHTTPRequestHandler, dirs: dict) -> None:
     handler.send_header("Content-Length", str(len(data)))
     handler.end_headers()
     handler.wfile.write(data)
+
+
+def _read_body(handler: BaseHTTPRequestHandler, length: int) -> bytes | None:
+    """The declared number of bytes, or None if the client stopped sending.
+
+    The timeout goes on the SOCKET, not on a wrapper around the read: the
+    read is what blocks, and only the socket can interrupt it. It is
+    restored afterwards so the connection is left exactly as it was found
+    for whatever handles it next.
+    """
+    sock = getattr(handler, "connection", None)
+    previous = None
+    if sock is not None:
+        try:
+            previous = sock.gettimeout()
+            sock.settimeout(UPLOAD_TIMEOUT_SECONDS)
+        except OSError:
+            sock = None
+    try:
+        return handler.rfile.read(length)
+    except (socket.timeout, TimeoutError, OSError):
+        return None
+    finally:
+        if sock is not None:
+            try:
+                sock.settimeout(previous)
+            except OSError:
+                pass
 
 
 def images_ok(images, state_dir) -> bool:

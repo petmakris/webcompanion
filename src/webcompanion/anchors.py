@@ -126,6 +126,13 @@ def resolve_anchor(a: dict, root) -> dict:
         return _fail(a if isinstance(a, dict) else {}, "refused", problem)
 
     rel = a["file"]
+    # Path("").resolve() is the PROCESS'S CWD -- "/" under launchd -- and
+    # `target.is_relative_to("/")` is true for every path on the machine, so
+    # an empty root turns the containment check below into a no-op that
+    # serves any file the daemon can read. A session with no root is a
+    # session with no source to resolve, not a session with unlimited reach.
+    if not str(root or "").strip():
+        return _fail(a, "refused", "%s: this session has no workspace root" % rel)
     try:
         root_real = Path(root).resolve()
         target = (root_real / rel).resolve()

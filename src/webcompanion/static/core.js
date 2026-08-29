@@ -97,7 +97,11 @@
 
   // Ask the server rather than inferring from the hostname: loopback grants
   // write access with no token at all, and only the server knows whether the
-  // token we hold is the current one (it is reminted on every restart).
+  // token we hold is still the configured one. The token is NOT reminted on
+  // restart -- it lives in the daemon's config file and survives every
+  // upgrade on purpose, because reminting it would invalidate the IDE
+  // plugin's saved credential mid-session. What can go stale is a token
+  // this tab kept from a machine whose config was replaced.
   async function resolveWritable() {
     try {
       const r = await fetch("/api/whoami", { headers: headers() });
@@ -208,7 +212,13 @@
   async function pollOnce() {
     try {
       const data = await api.fetchJSON("poll");
-      if (data.finished) {
+      // BOTH terminal states, not just finished. The SSE path ends on
+      // session-ended, which the daemon emits for either one; this is the
+      // path a client falls back to when SSE is broken, and it used to
+      // ignore `cancelled` entirely -- so a cancelled session polled the
+      // daemon once a second forever on exactly the transport a struggling
+      // connection is already using.
+      if (data.finished || data.cancelled) {
         ended = true;
         document.body.classList.add("session-finished");
         stopPolling();
