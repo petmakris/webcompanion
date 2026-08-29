@@ -27,7 +27,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from webcompanion import CONTRACT, __version__
-from webcompanion import anchors, events, gate, items, paths, threads, uploads
+from webcompanion import anchors, events, gate, items, paths, stream, threads, uploads
 from webcompanion.atomic import write_text_atomic
 from webcompanion.config import Config
 from webcompanion.registry import Registry
@@ -41,6 +41,7 @@ BANNER = f"webcompanion v{__version__}"
 # handler, so the routing stays a flat if/elif chain rather than a table of
 # functions.
 _SID_POLL_RE = re.compile(r"^/s/([^/]+)/poll$")
+_SID_STREAM_RE = re.compile(r"^/s/([^/]+)/stream$")
 _SID_FINISH_RE = re.compile(r"^/s/([^/]+)/api/finish$")
 _SID_CANCEL_RE = re.compile(r"^/s/([^/]+)/api/cancel$")
 _SID_ITEMS_RE = re.compile(r"^/s/([^/]+)/items$")
@@ -66,6 +67,13 @@ def _mark(state_dir: Path, name: str) -> None:
 
 def _is_marked(state_dir: Path, name: str) -> bool:
     return (Path(state_dir) / name).exists()
+
+
+def _is_terminal(state_dir: Path) -> bool:
+    """Finished or cancelled — either one ends a stream. Reads the same
+    files a separate watcher process polls; there is no daemon-memory
+    shortcut, because a restart must see the same answer the watcher does."""
+    return _is_marked(state_dir, _FINISHED_MARKER) or _is_marked(state_dir, _CANCELLED_MARKER)
 
 
 # Registered renderer roots are a FILE in the session's workspace, not
@@ -277,6 +285,9 @@ def _make_handler(daemon: Daemon):
             m = _SID_POLL_RE.match(path)
             if m:
                 return self._poll(m.group(1))
+            m = _SID_STREAM_RE.match(path)
+            if m:
+                return self._stream(m.group(1))
             m = _SID_ITEMS_RE.match(path)
             if m:
                 resolved, dirs = self._session(m.group(1))
@@ -644,6 +655,13 @@ def _make_handler(daemon: Daemon):
                 "items": items.versions_of(dirs["items_dir"]),
                 "threads": threads.list_versions(dirs["threads_dir"]),
             })
+
+        def _stream(self, sid: str) -> None:
+            resolved, dirs = self._session(sid)
+            if resolved is None:
+                return
+            stream.serve(self, resolved, dirs, registry=daemon.registry,
+                         is_terminal=_is_terminal)
 
         # ── open in editor ──────────────────────────────────────────────
         def _path_in_any_session_cwd(self, target: Path) -> bool:
