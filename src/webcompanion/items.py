@@ -43,7 +43,14 @@ def valid_anchor(anchor: str) -> bool:
     return ".." not in Path(anchor).parts
 
 
-def _encode(anchor: str) -> str:
+def encode_anchor(anchor: str) -> str:
+    """URL-quote `anchor` into a filename stem, hashing past a length cap
+    rather than truncating — truncation would collide two distinct long
+    anchors that share a prefix onto the same file.
+
+    Shared with the thread store (threads.py), so an item and its comment
+    thread land on matching on-disk names.
+    """
     enc = urllib.parse.quote(anchor, safe="")
     if len(enc) > _MAX_NAME:
         enc = "h_" + hashlib.sha256(anchor.encode("utf-8")).hexdigest()
@@ -51,24 +58,41 @@ def _encode(anchor: str) -> str:
 
 
 def _path_for(items_dir: Path, anchor: str) -> Path:
-    return Path(items_dir) / f"{_encode(anchor)}.json"
+    return Path(items_dir) / f"{encode_anchor(anchor)}.json"
 
 
-def put(items_dir: Path, anchor: str, body: dict) -> None:
+def _validated_payload(anchor: str, body: dict) -> str:
     if not valid_anchor(anchor):
         raise ValueError(f"invalid anchor: {anchor!r}")
     payload = json.dumps({"anchor": anchor, "body": body})
     if len(payload.encode("utf-8")) > MAX_BODY_BYTES:
         raise ValueError("item body too large")
+    return payload
+
+
+def put(items_dir: Path, anchor: str, body: dict) -> None:
+    payload = _validated_payload(anchor, body)
     Path(items_dir).mkdir(parents=True, exist_ok=True)
     write_text_atomic(_path_for(items_dir, anchor), payload)
 
 
 def put_many(items_dir: Path, bodies: dict, replace: bool = False) -> None:
     """Upsert every anchor in `bodies`. With replace=True, anchors absent from
-    `bodies` are deleted — the shape a full document push wants."""
-    for anchor, body in bodies.items():
-        put(items_dir, anchor, body)
+    `bodies` are deleted — the shape a full document push wants.
+
+    The whole batch is validated (anchor shape, body size) before any write
+    happens, so a single bad anchor or oversized body among many raises
+    ValueError with the store left completely unchanged — no partial write,
+    and no replace-deletes run either. This is not a guarantee against an I/O
+    failure partway through the write phase itself (disk full, permissions):
+    that can still leave a partial batch on disk. Only the validation phase
+    protects against the caller's own bad input, which is the failure mode
+    that actually happens.
+    """
+    payloads = {anchor: _validated_payload(anchor, body) for anchor, body in bodies.items()}
+    Path(items_dir).mkdir(parents=True, exist_ok=True)
+    for anchor, payload in payloads.items():
+        write_text_atomic(_path_for(items_dir, anchor), payload)
     if replace:
         for anchor in set(load_all(items_dir)) - set(bodies):
             delete(items_dir, anchor)

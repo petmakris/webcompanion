@@ -59,10 +59,19 @@ def test_an_anchor_that_could_escape_the_directory_is_rejected(tmp_path, anchor)
         items.put(tmp_path, anchor, {"t": "x"})
 
 
-def test_a_long_anchor_is_hashed_rather_than_truncated(tmp_path):
-    long_anchor = "src/" + "x" * 400 + ".java:L:12"
-    items.put(tmp_path, long_anchor, {"t": "x"})
-    assert items.load_one(tmp_path, long_anchor) == {"t": "x"}
+def test_two_long_anchors_sharing_a_prefix_do_not_collide(tmp_path):
+    # Both anchors share a common prefix longer than the encoding's length
+    # cap and differ only near the end. A truncating implementation would
+    # chop both down to the same shared prefix and collide onto one file;
+    # only a real hash of the full anchor keeps them distinct.
+    prefix = "src/" + "x" * 400
+    anchor_a = prefix + "/alpha.java:L:1"
+    anchor_b = prefix + "/beta.java:L:1"
+    items.put(tmp_path, anchor_a, {"t": "alpha-body"})
+    items.put(tmp_path, anchor_b, {"t": "beta-body"})
+    assert items.load_one(tmp_path, anchor_a) == {"t": "alpha-body"}
+    assert items.load_one(tmp_path, anchor_b) == {"t": "beta-body"}
+    assert len(items.load_all(tmp_path)) == 2
     assert all(len(p.name) <= 210 for p in tmp_path.iterdir())
 
 
@@ -83,3 +92,16 @@ def test_a_stray_lock_file_does_not_appear_as_an_item(tmp_path):
     items.snapshot(tmp_path)  # creates the chain file, and its .lock sidecar
     (tmp_path / f"{items.CHAIN_FILE}.lock").write_text("")
     assert items.load_all(tmp_path) == {"b-1": {"t": "good"}}
+
+
+def test_put_many_with_one_bad_anchor_writes_nothing(tmp_path):
+    with pytest.raises(ValueError):
+        items.put_many(tmp_path, {"b-1": {"t": "good"}, "../escape": {"t": "bad"}})
+    assert items.load_all(tmp_path) == {}
+
+
+def test_put_many_replace_with_one_bad_anchor_deletes_nothing(tmp_path):
+    items.put_many(tmp_path, {"b-1": {"t": "old"}})
+    with pytest.raises(ValueError):
+        items.put_many(tmp_path, {"b-2": {"t": "good"}, "": {"t": "bad"}}, replace=True)
+    assert items.load_all(tmp_path) == {"b-1": {"t": "old"}}
