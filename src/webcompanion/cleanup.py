@@ -13,6 +13,12 @@ backup, so the bias throughout is: when a rule is ambiguous, do not delete.
   bug affecting one kind to delete another kind's workspaces.
 - `prune_dead_rows` drops registry rows whose directories are gone or
   incomplete -- see the note on the Task 10 hazard below.
+- Every directory scan (`root.iterdir()`) is wrapped in `try/except OSError`
+  and skips just that root on failure. A cleanup pass must never be able to
+  stop the daemon from booting: `Daemon.start()` also wraps the whole
+  `cleanup.sweep(...)` call, but the scans guard themselves too, so one
+  unreadable kind directory does not abort the pass over the others even
+  when `sweep_strays` or `sweep` is called directly.
 
 `sweep` is the one function server.py calls: it runs `expire`, then
 `prune_dead_rows`, then `sweep_strays` for every kind directory present under
@@ -55,24 +61,52 @@ from webcompanion.registry import Registry
 _SID_DIR_RE = re.compile(r"^\d{6}-\d{6}-[0-9a-f]{16}$")
 
 
+# A workspace's own base directory's mtime only advances when a direct
+# child of BASE is created or removed -- not when something is written
+# inside items_dir, threads_dir, or state_dir. Annotation writes
+# (items.put/put_many/delete) go straight into items_dir and never touch
+# base, so base's mtime stops advancing right after creation. Taking base
+# alone as "last activity" would let a session under active annotation
+# expire mid-use the moment retention is configured. Take the newest mtime
+# across base and its meaningful children instead.
+_AGE_CHILDREN = ("items_dir", "threads_dir", "state_dir")
+
+
+def _last_activity(dirs: dict) -> float | None:
+    candidates: list[float] = []
+    try:
+        candidates.append(paths.base_of(dirs).stat().st_mtime)
+    except OSError:
+        pass
+    for key in _AGE_CHILDREN:
+        value = dirs.get(key)
+        if value is None:
+            continue
+        try:
+            candidates.append(Path(value).stat().st_mtime)
+        except OSError:
+            continue
+    return max(candidates) if candidates else None
+
+
 def expire(cfg: Config, registry: Registry) -> int:
-    """Delete workspaces whose base directory has been idle past
-    `cfg.retention_days`. Returns 0 and touches nothing if retention is
-    unconfigured -- the default -- because "infinite" must mean infinite,
-    not "whatever a hardcoded fallback happens to be".
+    """Delete workspaces idle past `cfg.retention_days`, measuring idleness
+    by the newest mtime across the workspace's base dir and its meaningful
+    children (see `_last_activity`). Returns 0 and touches nothing if
+    retention is unconfigured -- the default -- because "infinite" must mean
+    infinite, not "whatever a hardcoded fallback happens to be".
     """
     if cfg.retention_days is None:
         return 0
     cutoff = time.time() - cfg.retention_days * 86400
     removed = 0
     for sid, dirs in list(registry.items()):
-        base = paths.base_of(dirs)
-        try:
-            mtime = base.stat().st_mtime
-        except OSError:
+        activity = _last_activity(dirs)
+        if activity is None:
             continue  # can't tell how old it is -- conservative: leave it
-        if mtime > cutoff:
+        if activity > cutoff:
             continue
+        base = paths.base_of(dirs)
         try:
             shutil.rmtree(base)
         except OSError:
@@ -101,7 +135,11 @@ def sweep_strays(cfg: Config, kind: str, registry: Registry) -> int:
         return 0
     registered = {sid for sid, _ in registry.items()}
     removed = 0
-    for child in root.iterdir():
+    try:
+        children = list(root.iterdir())
+    except OSError:
+        return 0  # can't read this kind's directory -- skip it, don't crash
+    for child in children:
         if not child.is_dir():
             continue
         if not _SID_DIR_RE.match(child.name):
@@ -150,7 +188,11 @@ def sweep(cfg: Config, registry: Registry) -> dict[str, int]:
     strays_removed = 0
     root = paths.workspace_root(cfg)
     if root.is_dir():
-        for child in root.iterdir():
+        try:
+            children = list(root.iterdir())
+        except OSError:
+            children = []  # can't read the workspace root -- skip strays
+        for child in children:
             if not child.is_dir() or not paths.VALID_KIND_RE.match(child.name):
                 continue
             strays_removed += sweep_strays(cfg, child.name, registry)

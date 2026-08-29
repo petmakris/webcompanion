@@ -33,7 +33,12 @@ def test_retention_when_configured_removes_only_the_expired(tmp_path):
     old = _session(reg, cfg, "annotate", "old-one")
     new = _session(reg, cfg, "annotate", "new-one")
     ancient = time.time() - 86400 * 400
+    # Age EVERY meaningful directory, not just base: activity is measured as
+    # the newest mtime across base, items_dir, threads_dir and state_dir, so
+    # a genuinely dormant workspace has all of them old, not just its base.
     os.utime(paths.base_of(old), (ancient, ancient))
+    for key in ("items_dir", "threads_dir", "state_dir"):
+        os.utime(old[key], (ancient, ancient))
     assert cleanup.expire(cfg, reg) == 1
     assert not paths.base_of(old).exists()
     assert paths.base_of(new).is_dir()
@@ -76,10 +81,14 @@ def test_the_stray_sweep_cannot_reach_an_unregistered_sid_of_another_kind(tmp_pa
 
 
 def test_the_stray_sweep_ignores_directories_that_are_not_sid_shaped(tmp_path):
+    # Asserting only the count is not enough -- a mutation that deletes the
+    # directory but still returns 0 would pass. Assert what survives too.
     cfg = Config(workspace_root=tmp_path / "ws")
     reg = Registry(tmp_path / "state")  # empty on purpose: nothing is registered
-    (paths.kind_root(cfg, "annotate") / "not-a-session").mkdir(parents=True)
+    not_a_session = paths.kind_root(cfg, "annotate") / "not-a-session"
+    not_a_session.mkdir(parents=True)
     assert cleanup.sweep_strays(cfg, "annotate", reg) == 0
+    assert not_a_session.is_dir()
 
 
 def test_a_registered_workspace_is_never_a_stray(tmp_path):
@@ -137,3 +146,61 @@ def test_a_marker_recreated_directory_is_healed_by_prune_then_sweep(tmp_path):
     assert reg.lookup(sid) is None
     assert cleanup.sweep_strays(cfg, "annotate", reg) == 1
     assert not base.exists()
+
+
+def test_expire_does_not_delete_a_workspace_under_active_annotation(tmp_path):
+    """base_of(dirs)'s own mtime only advances when a direct child of BASE
+    changes -- annotation writes (items.put) go straight into items_dir and
+    never touch base, so base's mtime stops advancing right after creation.
+    Taking base alone as "last activity" would let a session under active
+    annotation expire mid-use the moment retention is configured.
+
+    This ages base past the cutoff, then writes an item (touching items_dir,
+    not base), and asserts the workspace SURVIVES the sweep despite base
+    itself looking ancient. Fails against an implementation that only checks
+    base's mtime.
+    """
+    import os
+
+    from webcompanion import items
+
+    cfg = Config(workspace_root=tmp_path / "ws", retention_days=30)
+    reg = Registry(tmp_path / "state")
+    dirs = _session(reg, cfg, "annotate", "active-one")
+    ancient = time.time() - 86400 * 400
+    os.utime(paths.base_of(dirs), (ancient, ancient))
+
+    items.put(dirs["items_dir"], "line:1", {"text": "still being annotated"})
+
+    assert cleanup.expire(cfg, reg) == 0
+    assert paths.base_of(dirs).is_dir()
+
+
+def test_an_unreadable_kind_directory_does_not_abort_the_rest_of_the_sweep(tmp_path):
+    """A permission error inside root.iterdir() must not raise out of
+    sweep() -- Daemon.start() calls cleanup.sweep() before binding its
+    socket, so an unhandled exception here means the daemon never starts.
+    The scan itself must be guarded, not just the per-child shutil.rmtree.
+
+    Makes "annotate"'s kind directory unreadable, then asserts sweep()
+    still completes and still reclaims a stray sitting in "deck".
+    """
+    import os
+
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")
+
+    deck_stray = paths.kind_root(cfg, "deck") / "251231-000000-cafebabecafebabe"
+    deck_stray.mkdir(parents=True)
+
+    annotate_root = paths.kind_root(cfg, "annotate")
+    annotate_root.mkdir(parents=True)
+    original_mode = annotate_root.stat().st_mode
+    os.chmod(annotate_root, 0)
+    try:
+        summary = cleanup.sweep(cfg, reg)  # must not raise
+    finally:
+        os.chmod(annotate_root, original_mode)  # tmp_path cleanup needs this back
+
+    assert isinstance(summary, dict)
+    assert not deck_stray.exists()  # the readable kind was still swept

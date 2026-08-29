@@ -22,6 +22,7 @@ import subprocess
 import sys
 import threading
 import time
+import traceback
 from html import escape as _html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from importlib.resources import as_file, files
@@ -162,7 +163,18 @@ class Daemon:
 
     def start(self) -> None:
         self.registry.rehydrate()
-        cleanup.sweep(self.cfg, self.registry)
+        # A cleanup failure must never keep the socket from binding: a
+        # PermissionError or a directory vanishing mid-scan here, left
+        # unguarded, means launchd's KeepAlive respawns forever with every
+        # skill seeing connection refused and nothing saying why. A daemon
+        # that skips a sweep is strictly better than one that refuses to
+        # start.
+        try:
+            cleanup.sweep(self.cfg, self.registry)
+        except Exception:
+            print("webcompanion: startup cleanup sweep failed, continuing:",
+                  file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
         self.registry.persist()
         handler = _make_handler(self)
         self._httpd = ThreadingHTTPServer((self.cfg.bind, self.cfg.port), handler)

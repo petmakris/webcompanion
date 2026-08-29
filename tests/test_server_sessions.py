@@ -3,6 +3,7 @@ from __future__ import annotations
 import threading
 
 from webcompanion import CONTRACT, __version__
+from webcompanion import cleanup
 from webcompanion.config import Config, mint_token
 from webcompanion.gate import CONTRACT_HEADER
 from webcompanion.server import Daemon
@@ -107,6 +108,32 @@ def test_finished_survives_a_daemon_restart(tmp_path):
         assert poll["finished"] is True
     finally:
         d2.stop()
+
+
+def test_the_daemon_boots_and_serves_even_when_the_startup_sweep_raises(tmp_path, monkeypatch):
+    """A cleanup failure (a PermissionError on a workspace directory, say)
+    must never keep the socket from binding. Daemon.start() calls
+    registry.rehydrate() -> cleanup.sweep() -> registry.persist() before
+    binding; if cleanup.sweep() were left unguarded, an exception here would
+    mean the daemon never starts -- under launchd's KeepAlive that is a
+    silent respawn loop with every client seeing connection refused and
+    nothing saying why. A daemon that skips a sweep must still boot.
+    """
+    def _boom(cfg, registry):
+        raise PermissionError("simulated: cleanup sweep failed")
+
+    monkeypatch.setattr(cleanup, "sweep", _boom)
+
+    cfg = Config(port=0, token=mint_token(), bind="127.0.0.1",
+                workspace_root=tmp_path / "ws")
+    d = Daemon(cfg, state_root=tmp_path / "state")
+    d.start()  # must not raise
+    try:
+        status, body = raw_call(d, "GET", "/health")
+        assert status == 200
+        assert body["contract"] == CONTRACT
+    finally:
+        d.stop()
 
 
 def test_supersede_ends_the_older_session_of_the_same_kind_and_cwd(call):
