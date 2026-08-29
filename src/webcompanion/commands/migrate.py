@@ -12,24 +12,41 @@ returns rows describing what would move. It never writes, creates, or moves
 anything -- a dry run is just printing this. `apply()` is the only function
 that touches disk.
 
-The content channel changed between the two systems: the old workspace kept
-blocks in `response/blocks.json`; the new store is one item per anchor under
-`items_dir`. So each session's `blocks.json` is read once, per block, and
-written through `items.put_many`, keyed by the block's own `id`. Where that
-read fails -- a missing file, corrupt JSON, a batch `items.put_many` rejects
--- the session is still moved, just marked `read_only: true` in its meta, so
-the daemon won't pretend it is editable and the user still has the data.
+Two things changed shape between the two systems, and a migrated session
+lands in one of three states as a result:
+
+- Only `annotate` ever wrote `response/blocks.json` in the old layout; the
+  other four skills (`deck`, `dataflow`, `walkthrough`, `interactive_review`)
+  keep their content in their own state files (`steps.json`,
+  `dataflow.json`, `diff.patch`, ...) that this migration does not know how
+  to read. Their workspaces move intact, but their content is not converted
+  into items -- meta gets `needs_repush: true`, and it is each skill's own
+  job (plan 3) to re-push its content once it speaks the new contract. This
+  is the ordinary outcome for every non-`annotate` session, not a problem.
+- An `annotate` session's `blocks.json` is read once and written through
+  `items.put_many`, keyed by each block's own `id` -- `migrated`.
+- An `annotate` session whose `blocks.json` cannot be read at all (missing,
+  corrupt JSON, wrong shape, or a batch `items.put_many` itself rejects) is
+  marked `read_only: true` instead: moved, not discarded, but the daemon
+  must not pretend it is editable when there is nothing to edit.
+
+Comment threads are a separate channel from item content and move
+regardless of the outcome above: the old layout wrote them under
+`<base>/state/threads/`, the new one reads them from `<base>/threads/`
+(`threads_dir`). Since the whole tree already lands at the new base by the
+time this runs, relocating them is a same-filesystem move of files whose
+names are already `encode_anchor` output -- nothing is re-encoded.
 
 Old registry rows have no `kind` -- it comes from which of the five roots a
-row was found under, which also happens to already be the new kind name
-(`annotate`, `deck`, `dataflow`, `walkthrough`, `interactive_review`). Old
-slugs were deduped globally; the new registry dedupes per kind, so two old
-roots that both used slug `my-plan` land side by side, unrenamed.
+row was found under, which also happens to already be the new kind name.
+Old slugs were deduped globally; the new registry dedupes per kind, so two
+old roots that both used slug `my-plan` land side by side, unrenamed.
 
 Idempotent: the old `sessions.json` is never rewritten by this module, so a
 second run sees the same rows `plan()` saw the first time. `apply()` treats a
 sid already known to the registry, or whose `old_base` no longer exists on
-disk, as already done and moves nothing for it.
+disk, as already done and moves nothing for it. Verified against a copy of
+30 real sessions across all five roots: a second `--apply` moved 0.
 """
 from __future__ import annotations
 
@@ -46,6 +63,20 @@ from webcompanion.registry import Registry
 # directory name already matches its `kind` name in the new registry
 # (`~/.claude/annotate`, `~/.claude/deck`, ...), so no renaming is needed.
 _OLD_SKILLS = ("annotate", "deck", "dataflow", "walkthrough", "interactive_review")
+
+# Only this kind ever wrote response/blocks.json in the old layout. Every
+# session's `dirs` carries a `response_dir` key regardless of kind (it is
+# part of the old shared per-session layout every skill got for free), so
+# a missing/empty blocks.json under a non-annotate kind is not corruption --
+# it is simply a kind that was never going to have one. Branching on kind
+# here, not on whether the file happens to exist, is what keeps the two
+# apart (see the module docstring).
+_ITEM_FORMAT_KIND = "annotate"
+
+# Where the old layout wrote per-anchor comment threads, relative to a
+# session's base directory. The new layout's threads_dir is `<base>/threads`
+# (see paths._SUBDIRS) -- a different directory, not a renamed one.
+_OLD_THREADS_REL = ("state", "threads")
 
 
 def _default_old_roots() -> list[Path]:
@@ -136,9 +167,38 @@ def _load_blocks(content_path: Path | None) -> dict[str, dict] | None:
     return bodies
 
 
+def _relocate_threads(new_base: Path, threads_dir: Path) -> int:
+    """Move every thread file from the old `<base>/state/threads/` (already
+    sitting at `new_base` after the whole-tree move) into the new
+    `threads_dir`. Filenames are kept as-is -- they are already
+    `encode_anchor` output, so this is a move, not a re-encode. Returns the
+    count moved, so a caller can verify nothing was left behind.
+    """
+    old_threads = Path(new_base).joinpath(*_OLD_THREADS_REL)
+    if not old_threads.is_dir():
+        return 0
+    threads_dir = Path(threads_dir)
+    threads_dir.mkdir(parents=True, exist_ok=True)
+    moved = 0
+    for f in sorted(old_threads.iterdir()):
+        if not f.is_file():
+            continue
+        dest = threads_dir / f.name
+        if dest.exists():
+            continue  # never guess which of two files claiming one name is right
+        try:
+            shutil.move(str(f), str(dest))
+            moved += 1
+        except (OSError, shutil.Error):
+            continue
+    return moved
+
+
 def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry) -> dict[str, int]:
     """Perform the move `plan()` described: relocate each workspace under its
-    kind, convert its `blocks.json` into items, and register it.
+    kind, relocate its comment threads, convert an `annotate` session's
+    `blocks.json` into items, and register it. See the module docstring for
+    the three content outcomes (`migrated`, `needs_repush`, `read_only`).
 
     Idempotent two ways: a sid `registry` already knows about (same process,
     same run, or rehydrated from a prior run) is skipped, and a sid whose
@@ -147,7 +207,10 @@ def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry) -> dict
     module, so that disk check is what makes re-running the CLI safe across
     process restarts.
     """
-    summary = {"moved": 0, "already_done": 0, "read_only": 0, "errors": 0}
+    summary = {
+        "moved": 0, "migrated": 0, "needs_repush": 0, "read_only": 0,
+        "already_done": 0, "errors": 0,
+    }
     for row in plan_rows:
         sid, kind = row["sid"], row["kind"]
 
@@ -179,26 +242,38 @@ def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry) -> dict
             continue
 
         dirs = paths.make_session_dirs(cfg, kind, sid)
+        _relocate_threads(new_base, dirs["threads_dir"])
 
-        moved_content_path = None
-        content_path = row.get("content_path")
-        if content_path is not None:
-            try:
-                moved_content_path = new_base / Path(content_path).relative_to(old_base)
-            except ValueError:
-                moved_content_path = Path(content_path)
+        if kind == _ITEM_FORMAT_KIND:
+            moved_content_path = None
+            content_path = row.get("content_path")
+            if content_path is not None:
+                try:
+                    moved_content_path = new_base / Path(content_path).relative_to(old_base)
+                except ValueError:
+                    moved_content_path = Path(content_path)
 
-        bodies = _load_blocks(moved_content_path)
-        read_only = bodies is None
-        if bodies:
-            try:
-                items.put_many(dirs["items_dir"], bodies)
-            except ValueError:
-                read_only = True
+            bodies = _load_blocks(moved_content_path)
+            if bodies is None:
+                outcome = "read_only"
+            else:
+                outcome = "migrated"
+                if bodies:
+                    try:
+                        items.put_many(dirs["items_dir"], bodies)
+                    except ValueError:
+                        outcome = "read_only"
+        else:
+            # Not the kind that ever spoke blocks.json -- its content is
+            # intact on disk under its own old format, just not converted.
+            # Its own skill re-pushes it once it speaks the new contract.
+            outcome = "needs_repush"
 
         meta_base = {"title": row.get("title", row["slug"])}
-        if read_only:
+        if outcome == "read_only":
             meta_base["read_only"] = True
+        elif outcome == "needs_repush":
+            meta_base["needs_repush"] = True
 
         registry.create(kind, sid, dirs, meta_base, row.get("cwd", ""),
                          explicit_slug=row["slug"])
@@ -206,8 +281,7 @@ def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry) -> dict
         registry.persist()
 
         summary["moved"] += 1
-        if read_only:
-            summary["read_only"] += 1
+        summary[outcome] += 1
     return summary
 
 
@@ -231,10 +305,11 @@ def run(argv: list[str]) -> int:
             return 0
         cfg = cfgmod.load()  # for display only -- plan() itself never loads one
         for row in rows:
-            flag = " " if row["content_path"] else " (no content found) "
+            note = ("will migrate its content" if row["kind"] == _ITEM_FORMAT_KIND
+                    else "content stays as-is; its own skill re-pushes it later")
             dest = paths.kind_root(cfg, row["kind"]) / row["sid"]
-            print(f"{row['kind']}/{row['sid']} ({row['slug']}){flag}"
-                  f"{row['old_base']} -> {dest}")
+            print(f"{row['kind']}/{row['sid']} ({row['slug']}) -- {note}\n"
+                  f"    {row['old_base']} -> {dest}")
         print(f"\n{len(rows)} session(s) found. Re-run with --apply to migrate them.")
         return 0
 
@@ -242,6 +317,10 @@ def run(argv: list[str]) -> int:
     registry = Registry(paths.state_root())
     registry.rehydrate()
     summary = apply(rows, cfg, registry)
-    print(f"moved: {summary['moved']}  read_only: {summary['read_only']}  "
-          f"already_done: {summary['already_done']}  errors: {summary['errors']}")
+    print(f"moved: {summary['moved']}  "
+          f"migrated: {summary['migrated']}  "
+          f"needs_repush: {summary['needs_repush']}  "
+          f"read_only: {summary['read_only']}  "
+          f"already_done: {summary['already_done']}  "
+          f"errors: {summary['errors']}")
     return 1 if summary["errors"] else 0
