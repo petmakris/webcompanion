@@ -97,9 +97,10 @@ def test_a_file_over_the_byte_cap_is_missing_not_read(repo):
 
 
 def test_a_very_long_line_is_truncated(repo):
-    (repo / "min.js").write_text("a" * (anchors.MAX_LINE_CHARS + 500))
+    long_line = "a" * (anchors.MAX_LINE_CHARS + 500)
+    (repo / "min.js").write_text(long_line)
     out = anchors.resolve_anchor(
-        {"file": "min.js", "line": 1, "snippet": "aaa"}, repo)
+        {"file": "min.js", "line": 1, "snippet": long_line}, repo)
     lengths = [len(l["text"]) for l in out["lines"]]
     assert max(lengths) <= anchors.MAX_LINE_CHARS + len(" … [line truncated]")
     assert any(l["text"].endswith("[line truncated]") for l in out["lines"])
