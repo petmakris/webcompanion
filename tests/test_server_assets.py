@@ -89,3 +89,30 @@ def test_a_registered_renderer_survives_a_daemon_restart(tmp_path):
         assert raw_call(d2, "GET", f"/s/{s['sid']}/assets/app.js") == (200, "console.log(1)")
     finally:
         d2.stop()
+
+
+def test_a_registered_entry_cannot_inject_script_into_the_shell_page(tmp_path, call):
+    """Stored XSS. `entry` was interpolated raw into
+    `<script src="assets/%s">`, two lines below a `title` that IS escaped.
+
+    The payload closes the attribute and the tag and opens its own. It lands
+    on the daemon's origin, which is where the browser runtime keeps the
+    write token in sessionStorage -- so this is credential theft, not just a
+    defaced page.
+    """
+    static_root = tmp_path / "static"
+    static_root.mkdir()
+    payload = '"></script><script>alert(document.domain)</script><script src="x'
+
+    status, _ = call("POST", "/api/sessions",
+                     {"kind": "annotate", "cwd": str(tmp_path), "title": "t"})
+    _, created = call("POST", "/api/sessions",
+                      {"kind": "annotate", "cwd": str(tmp_path), "title": "t"})
+    sid = created["sid"]
+    call("POST", f"/s/{sid}/api/assets",
+         {"static_root": str(static_root), "entry": payload})
+
+    _, html = call("GET", f"/s/{sid}/")
+    assert "<script>alert(document.domain)</script>" not in html
+    assert "&lt;/script&gt;" in html and "&quot;" in html
+    assert html.count("<script") == html.count("</script>")

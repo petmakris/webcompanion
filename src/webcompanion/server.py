@@ -662,8 +662,14 @@ def _make_handler(daemon: Daemon):
             info = _read_asset_root(paths.base_of(dirs))
             entry_tag = ""
             if info and info.get("entry"):
+                # ESCAPED, exactly like the title two lines below. `entry` is
+                # whatever a POST to /api/assets stored, so an unescaped
+                # interpolation here closes the src attribute and the script
+                # tag and runs attacker JS on the daemon's own origin -- with
+                # the write token in sessionStorage for that origin. quote=True
+                # is what handles the `"` that does the closing.
                 entry_tag = ('<script type="module" src="assets/%s"></script>'
-                             % info["entry"])
+                             % _html_escape(info["entry"], quote=True))
             title = daemon.registry.get_meta(sid).get("title") or "webcompanion"
             with _static_file("shell.html") as p:
                 template = p.read_text()
