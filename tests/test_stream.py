@@ -115,6 +115,19 @@ def test_only_the_documented_frames_are_emitted():
                        "session-ended"}
 
 
+def test_the_opening_snapshot_marks_its_frames_initial(daemon, call):
+    # A client that has just fetched current state does not need to
+    # re-render on the stream's opening echo of every existing anchor --
+    # see core.js's onDelta contract. Only the snapshot loop sets this; a
+    # later item-changed from a real write (test above) has no such key.
+    s = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})[1]
+    call("PUT", f"/s/{s['sid']}/items/b-1", {"t": "a"})
+    frames = _read_frames(f"{daemon.url}/s/{s['sid']}/stream", 2)
+    snapshot = [f for f in frames if f[0] == "item-changed"]
+    assert snapshot, f"expected an item-changed snapshot frame, got {[f[0] for f in frames]}"
+    assert snapshot[0][1].get("initial") is True
+
+
 def test_a_finished_session_ends_the_stream(daemon, call):
     s = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})[1]
     call("POST", f"/s/{s['sid']}/api/finish")

@@ -115,6 +115,15 @@
   // {anchor, version}, thread-deleted {anchor}, heartbeat, session-ended.
   // document-changed is defined but not emitted by the daemon today, so it
   // is bound defensively and never depended on.
+  //
+  // onDelta contract: called as onDelta({kind, anchor, version, initial}).
+  // `initial` is true for a delta that only echoes state a client can
+  // already see from its own first fetch -- the stream's opening snapshot
+  // reports every existing anchor so a client connecting LATE still gets
+  // full state, but a client that just loaded the page does not need to
+  // re-render on these. A client may safely skip initial deltas; it must
+  // NOT skip non-initial ones, and a late-connecting client still needs the
+  // initial batch to learn about anchors it has not fetched yet.
   let onDelta = () => {};
   let lastVersions = {};
   let es = null;
@@ -123,6 +132,13 @@
   let usingPoll = false;
   let reconnectTimer = null;
   let ended = false;
+  // True once the first full-state read has completed, from whichever
+  // transport gets there first (EventSource's "connected" always precedes
+  // its own snapshot burst; a poll fallback that starts before EventSource
+  // ever connects gets exactly one initial batch of its own). Once set, no
+  // later delta from either transport is ever marked initial again -- a
+  // change that arrives while switching transports is a real change.
+  let firstSnapshotSeen = false;
   const pollIntervalMs = 1000;
 
   function frame(ev) {
@@ -135,24 +151,25 @@
     es.addEventListener("connected", () => {
       esErrorCount = 0;
       stopPolling();
+      firstSnapshotSeen = true;
     });
     es.addEventListener("heartbeat", () => { esErrorCount = 0; });
     es.addEventListener("item-changed", (ev) => {
       const d = frame(ev);
       lastVersions[d.anchor] = d.version;
-      onDelta({ kind: "item", anchor: d.anchor, version: d.version });
+      onDelta({ kind: "item", anchor: d.anchor, version: d.version, initial: !!d.initial });
     });
     es.addEventListener("document-changed", (ev) => {
       const d = frame(ev);
-      onDelta({ kind: "document", anchor: null, version: d.version });
+      onDelta({ kind: "document", anchor: null, version: d.version, initial: false });
     });
     es.addEventListener("thread-changed", (ev) => {
       const d = frame(ev);
-      onDelta({ kind: "thread", anchor: d.anchor, version: d.version });
+      onDelta({ kind: "thread", anchor: d.anchor, version: d.version, initial: !!d.initial });
     });
     es.addEventListener("thread-deleted", (ev) => {
       const d = frame(ev);
-      onDelta({ kind: "thread-deleted", anchor: d.anchor, version: 0 });
+      onDelta({ kind: "thread-deleted", anchor: d.anchor, version: 0, initial: false });
     });
     es.addEventListener("session-ended", () => {
       ended = true;
@@ -198,19 +215,25 @@
         closeStream();
         return;
       }
+      // Only the very first successful full-state read of the whole page
+      // (from whichever transport gets there first) is a snapshot; see the
+      // firstSnapshotSeen comment above init(). A poll that starts because
+      // EventSource just dropped is reporting real changes, not a snapshot.
+      const isInitial = !firstSnapshotSeen;
+      firstSnapshotSeen = true;
       const items = data.items || {};
       const threads = data.threads || {};
       for (const anchor of Object.keys(items)) {
         if (lastVersions[anchor] !== items[anchor]) {
           lastVersions[anchor] = items[anchor];
-          onDelta({ kind: "item", anchor, version: items[anchor] });
+          onDelta({ kind: "item", anchor, version: items[anchor], initial: isInitial });
         }
       }
       for (const anchor of Object.keys(threads)) {
         const key = "thread:" + anchor;
         if (lastVersions[key] !== threads[anchor]) {
           lastVersions[key] = threads[anchor];
-          onDelta({ kind: "thread", anchor, version: threads[anchor] });
+          onDelta({ kind: "thread", anchor, version: threads[anchor], initial: isInitial });
         }
       }
     } catch (e) {

@@ -123,13 +123,18 @@ def serve(handler, sid: str, dirs: dict, *, registry, is_terminal) -> None:
         if not emit("connected", {}):
             return
 
+        # The opening snapshot echoes every anchor the caller could already
+        # see with its own first GET -- a client that has just fetched
+        # current state does not need to re-render on these. Marked
+        # "initial": True so the runtime can tell them apart from a frame
+        # that reports an actual change; the main loop below never sets it.
         last_items = items_mod.versions_of(dirs["items_dir"])
         last_threads = threads_mod.list_versions(dirs["threads_dir"])
         for anchor, version in last_items.items():
-            if not emit("item-changed", {"anchor": anchor, "version": version}):
+            if not emit("item-changed", {"anchor": anchor, "version": version, "initial": True}):
                 return
         for anchor, version in last_threads.items():
-            if not emit("thread-changed", {"anchor": anchor, "version": version}):
+            if not emit("thread-changed", {"anchor": anchor, "version": version, "initial": True}):
                 return
 
         # Compared against a VALUE, not an edge. A change landing between the
