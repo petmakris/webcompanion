@@ -1,0 +1,27 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "webcompanion"
+version = "0.1.0"
+description = "A local always-on companion server: addressable items, comment threads, and an event queue."
+readme = "README.md"
+requires-python = ">=3.9"
+license = {text = "MIT"}
+authors = [{name = "Petros Makris"}]
+dependencies = []
+classifiers = [
+  "Programming Language :: Python :: 3.9",
+  "Operating System :: MacOS",
+  "Operating System :: POSIX :: Linux",
+]
+
+[project.scripts]
+webcompanion = "webcompanion.cli:main"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.setuptools.package-data]
+webcompanion = ["static/*", "service/*"]
