@@ -77,9 +77,107 @@ def test_doctor_fails_when_no_service_python_can_be_resolved(monkeypatch, capsys
     assert "not found" in out
 
 
-def test_doctor_reports_a_healthy_daemon(wired, capsys):
+def _pretend_installed(monkeypatch, tmp_path):
+    """A plist/unit on disk that the supervisor knows about, without going
+    anywhere near the real login session."""
+    service = tmp_path / "dev.webcompanion.plist"
+    service.write_text("<service definition>")
+    monkeypatch.setattr(doctor, "_service_file", lambda: (service, True))
+    monkeypatch.setattr(doctor, "_supervisor_knows_the_job", lambda: True)
+    return service
+
+
+def test_doctor_reports_a_healthy_daemon(wired, tmp_path, monkeypatch, capsys):
+    _pretend_installed(monkeypatch, tmp_path)
     assert doctor.run([]) == 0
     assert "ok" in capsys.readouterr().out.lower()
+
+
+def test_doctor_tells_never_installed_apart_from_installed_correctly(
+        wired, tmp_path, monkeypatch, capsys):
+    """Both used to print the same line -- "no service installed, or
+    resolved via /usr/bin/env" -- so doctor could not distinguish a machine
+    that never ran install-service from a healthy one. Opposite diagnoses,
+    opposite fixes."""
+    monkeypatch.setattr(doctor, "_service_file",
+                        lambda: (tmp_path / "absent.plist", False))
+    assert doctor.run([]) == 1
+    absent = capsys.readouterr().out
+    assert "NOT INSTALLED" in absent
+    assert "webcompanion install-service" in absent
+
+    _pretend_installed(monkeypatch, tmp_path)
+    assert doctor.run([]) == 0
+    assert "knows the job" in capsys.readouterr().out
+
+
+def test_doctor_reports_a_service_file_the_supervisor_never_loaded(
+        wired, tmp_path, monkeypatch, capsys):
+    """A plist on disk is not a running service. An install that wrote the
+    file and failed to load it looks identical on disk to one that worked --
+    which is exactly what the Linux install-service bug produced."""
+    _pretend_installed(monkeypatch, tmp_path)
+    monkeypatch.setattr(doctor, "_supervisor_knows_the_job", lambda: False)
+    assert doctor.run([]) == 1
+    out = capsys.readouterr().out
+    assert "does NOT know the job" in out
+
+
+def test_doctor_reports_an_unreadable_sessions_file(wired, tmp_path, monkeypatch, capsys):
+    """The file whose loss deletes data. doctor must surface it BEFORE the
+    next restart, not after."""
+    from webcompanion import paths as pathsmod
+
+    _pretend_installed(monkeypatch, tmp_path)
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "sessions.json").write_text("{not json")
+    monkeypatch.setattr(pathsmod, "state_root", lambda: state)
+
+    assert doctor.run([]) == 1
+    out = capsys.readouterr().out
+    assert "sessions.json: UNREADABLE" in out
+    assert "refuses its startup stray sweep" in out
+
+
+def test_doctor_tails_the_service_log(wired, tmp_path, monkeypatch, capsys):
+    """A user told "see the log" and left to find it has been told nothing:
+    launchd rotates it and nobody reads it until something else breaks."""
+    from webcompanion import paths as pathsmod
+
+    _pretend_installed(monkeypatch, tmp_path)
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "webcompanion.log").write_text(
+        "\n".join(f"line {i}" for i in range(50)))
+    monkeypatch.setattr(pathsmod, "state_root", lambda: state)
+
+    doctor.run([])
+    out = capsys.readouterr().out
+    assert "line 49" in out
+    assert "line 30" in out, "the tail is shorter than LOG_TAIL_LINES"
+    assert "line 10" not in out, "the tail is not bounded"
+
+
+def test_doctor_reports_a_refused_sweep_differently_from_a_failed_one(
+        wired, tmp_path, monkeypatch, capsys):
+    """A refusal is the safety mechanism working -- nothing was deleted. It
+    must not read as a crash."""
+    from webcompanion import paths as pathsmod
+
+    _pretend_installed(monkeypatch, tmp_path)
+    state = tmp_path / "state"
+    state.mkdir(exist_ok=True)
+    (state / "startup_sweep_failed.json").write_text(json.dumps({
+        "when": 1234567890.0,
+        "refused": "the registry is empty but ~/ws still holds sessions",
+    }))
+    monkeypatch.setattr(pathsmod, "state_root", lambda: state)
+
+    assert doctor.run([]) == 1
+    out = capsys.readouterr().out
+    assert "REFUSED" in out
+    assert "nothing was deleted" in out
 
 
 def test_doctor_names_the_port_holder_when_the_port_is_taken(monkeypatch, capsys):

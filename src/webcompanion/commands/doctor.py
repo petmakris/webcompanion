@@ -1,11 +1,13 @@
 """`webcompanion doctor` -- succeeds the older `annotate-doctor`.
 
 Reports, in order: python3 and its version, the config file and its mode,
-the zipapp's presence, the interpreter the installed service actually
-references (a dangling one is the Homebrew-retired-the-venv failure this
-whole task exists to end), the port holder, the restart count (a respawn
-loop), and the health response. Never installs anything -- see
-`commands/_common.py`.
+whether `sessions.json` parses, the zipapp's presence, whether the service
+is installed AT ALL and whether launchd/systemd knows the job, the
+interpreter the installed service actually references (a dangling one is the
+Homebrew-retired-the-venv failure this whole task exists to end), the port
+holder, the restart count (a respawn loop), the health response, the last
+lines of the service log, and any startup-sweep failure or refusal. Never
+installs anything -- see `commands/_common.py`.
 """
 from __future__ import annotations
 
@@ -28,6 +30,7 @@ from webcompanion.commands.install_service import (
     default_zipapp_path,
 )
 from webcompanion.commands.serve import port_holder as _port_holder
+from webcompanion.registry import ABSENT, LOADED, UNREADABLE, Registry
 
 REPORTABLE = (DaemonUnreachable, ContractMismatch, HttpError)
 
@@ -36,6 +39,83 @@ REPORTABLE = (DaemonUnreachable, ContractMismatch, HttpError)
 RESTART_LOOP_THRESHOLD = 5
 
 SWEEP_FAILURE_MARKER = "startup_sweep_failed.json"
+
+# How much of the service log to show. Enough to carry a traceback and the
+# lines around it; not so much that the report stops being readable.
+LOG_TAIL_LINES = 20
+
+
+def _service_file() -> tuple[Path, bool]:
+    """(the path install-service would write, whether it is there).
+
+    "No service installed" and "service installed correctly" used to print
+    the SAME line -- "no service installed, or resolved via /usr/bin/env" --
+    so `doctor` could not tell a machine that never ran install-service from
+    a healthy one. They are opposite diagnoses with opposite fixes.
+    """
+    path = (default_plist_path(DEFAULT_LABEL) if sys.platform == "darwin"
+            else default_unit_path(DEFAULT_SERVICE_NAME))
+    return path, path.is_file()
+
+
+def _supervisor_knows_the_job() -> bool | None:
+    """Whether launchd/systemd has the job loaded, or None if unknowable.
+
+    A plist on disk is not a running service: launchd only knows about it
+    once it has been bootstrapped, and an install that wrote the file but
+    failed to load it looks identical on disk to one that worked.
+    """
+    if sys.platform == "darwin":
+        launchctl = shutil.which("launchctl")
+        if not launchctl:
+            return None
+        try:
+            proc = subprocess.run([launchctl, "list", DEFAULT_LABEL],
+                                  capture_output=True, text=True, timeout=3)
+        except (OSError, subprocess.SubprocessError):
+            return None
+        return proc.returncode == 0
+    systemctl = shutil.which("systemctl")
+    if not systemctl:
+        return None
+    try:
+        proc = subprocess.run(
+            [systemctl, "--user", "is-enabled", DEFAULT_SERVICE_NAME],
+            capture_output=True, text=True, timeout=3)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return proc.returncode == 0
+
+
+def log_path() -> Path:
+    """Where install-service points the service's stderr."""
+    return paths.state_root() / "webcompanion.log"
+
+
+def _log_tail(n: int = LOG_TAIL_LINES) -> list[str] | None:
+    """The last `n` lines of the service log, or None if there is no log.
+
+    A user told "see the log" and left to find it has been told nothing --
+    launchd rotates it, and nobody reads it until something else breaks.
+    """
+    try:
+        text = log_path().read_text(errors="replace")
+    except OSError:
+        return None
+    lines = [ln for ln in text.splitlines() if ln.strip()]
+    return lines[-n:]
+
+
+def _sessions_file_status() -> tuple[str, int]:
+    """(status, row count) for sessions.json -- the file whose loss deletes
+    data, because the stray sweep removes every workspace no row points at.
+
+    This is the same check Registry.rehydrate makes on boot, run here so a
+    user can see the problem BEFORE the next restart rather than after it.
+    """
+    reg = Registry(paths.state_root())
+    status = reg.rehydrate()
+    return status, len(reg.items())
 
 
 def _service_program_args() -> list[str] | None:
@@ -201,13 +281,49 @@ def run(argv: list[str]) -> int:
             print(f"  warning: expected mode 0600, got {oct(mode)} -- "
                   f"the write token may be readable by other users")
 
+    sessions_status, rows = _sessions_file_status()
+    sessions_file = paths.state_root() / "sessions.json"
+    if sessions_status == LOADED:
+        print(f"sessions.json: parses, {rows} live session(s)")
+    elif sessions_status == ABSENT:
+        print(f"sessions.json: not written yet at {sessions_file} "
+              f"(normal before the first session)")
+    else:
+        ok = False
+        print(f"sessions.json: UNREADABLE at {sessions_file}")
+        print(f"  the daemon cannot tell which workspaces are live, so it "
+              f"refuses its startup stray sweep rather than deleting them.")
+        print(f"  fix or remove that file, then restart the service.")
+
     pyz = default_zipapp_path()
     print(f"zipapp: {pyz} ({'present' if pyz.is_file() else 'missing'})")
 
+    service_path, service_installed = _service_file()
+    if not service_installed:
+        ok = False
+        print(f"service: NOT INSTALLED -- nothing at {service_path}")
+        print("  run: webcompanion install-service")
+    else:
+        known = _supervisor_knows_the_job()
+        supervisor = "launchd" if sys.platform == "darwin" else "systemd"
+        if known is True:
+            print(f"service: installed at {service_path}, and {supervisor} "
+                  f"knows the job")
+        elif known is False:
+            ok = False
+            print(f"service: installed at {service_path}, but {supervisor} "
+                  f"does NOT know the job -- the file was written and never "
+                  f"loaded")
+            print("  run: webcompanion install-service")
+        else:
+            print(f"service: installed at {service_path} ({supervisor} could "
+                  f"not be queried)")
+
     interp = _service_interpreter()
     if interp is None:
-        print("service interpreter: no service installed, or resolved via "
-              "/usr/bin/env (never dangles)")
+        print("service interpreter: resolved via /usr/bin/env (never dangles)"
+              if service_installed else
+              "service interpreter: n/a -- no service installed")
     elif not interp.exists():
         ok = False
         print(f"service interpreter: {interp} is DANGLING (no longer "
@@ -248,9 +364,25 @@ def run(argv: list[str]) -> int:
     if failure is not None:
         ok = False
         marker_path = paths.state_root() / SWEEP_FAILURE_MARKER
-        print(f"startup cleanup: FAILED at {failure.get('when')} -- "
-              f"{failure.get('error')}")
-        print(f"  the daemon still started, but its startup cleanup sweep "
-              f"did not run; see {marker_path}")
+        if failure.get("refused"):
+            print(f"startup cleanup: the stray sweep was REFUSED at "
+                  f"{failure.get('when')} -- {failure['refused']}")
+            print(f"  nothing was deleted, which is the point. Fix the cause "
+                  f"and restart; see {marker_path}")
+        else:
+            print(f"startup cleanup: FAILED at {failure.get('when')} -- "
+                  f"{failure.get('error')}")
+            print(f"  the daemon still started, but its startup cleanup sweep "
+                  f"did not run; see {marker_path}")
+
+    tail = _log_tail()
+    if tail is None:
+        print(f"log: nothing at {log_path()} yet")
+    elif not tail:
+        print(f"log: {log_path()} is empty (nothing has gone wrong)")
+    else:
+        print(f"log: last {len(tail)} line(s) of {log_path()}")
+        for line in tail:
+            print(f"  | {line}")
 
     return 0 if ok else 1
