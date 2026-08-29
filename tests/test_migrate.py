@@ -96,3 +96,18 @@ def test_plan_reports_what_it_will_do_without_touching_anything(tmp_path):
     p = migrate.plan([old / "annotate"])
     assert p and p[0]["sid"] == "s1" and p[0]["kind"] == "annotate"
     assert not paths.kind_root(cfg, "annotate").exists()
+
+
+def test_plan_creates_no_new_directory_anywhere(tmp_path):
+    # Stronger than the check above: rather than asking about one path a
+    # bug might happen to miss, this asks about every directory under
+    # tmp_path, so a plan() that mkdirs ANY new destination -- under any
+    # config, including one plan() never even sees -- gets caught. This is
+    # the shape of check that would have caught it if `plan()` had ever
+    # created its `new_base` eagerly instead of just naming it.
+    old = tmp_path / "old"
+    _old_workspace(old, "annotate", "s1", "my-plan", [{"id": "b-1", "markdown": "hi"}])
+    before = {p for p in tmp_path.rglob("*") if p.is_dir()}
+    migrate.plan([old / "annotate"])
+    after = {p for p in tmp_path.rglob("*") if p.is_dir()}
+    assert after == before
