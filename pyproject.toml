@@ -30,6 +30,11 @@ webcompanion = "webcompanion.cli:main"
 # never imported by anything under src/.
 dev = ["pytest", "playwright"]
 
+[tool.pytest.ini_options]
+markers = [
+  "real_state_root: opt out of the conftest guard that redirects paths.state_root() away from ~/.claude/webcompanion",
+]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

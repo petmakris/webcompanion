@@ -49,5 +49,6 @@ def test_a_sid_that_could_escape_the_root_is_rejected(tmp_path, bad):
         paths.make_session_dirs(Config(workspace_root=tmp_path), "annotate", bad)
 
 
+@pytest.mark.real_state_root
 def test_default_root_is_under_the_claude_directory():
     assert paths.workspace_root(Config()) == Path("~/.claude/webcompanion/workspaces").expanduser()

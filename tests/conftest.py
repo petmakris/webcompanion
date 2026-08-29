@@ -6,8 +6,31 @@ import urllib.request
 
 import pytest
 
+from webcompanion import paths
 from webcompanion.config import Config, mint_token
 from webcompanion.server import Daemon
+
+
+@pytest.fixture(autouse=True)
+def _never_the_real_state_root(request, tmp_path, monkeypatch):
+    """No test may touch `~/.claude/webcompanion`.
+
+    Earned the hard way while writing tests/test_integration.py: a test that
+    called `migrate.run(["--apply"])` with only `config_path` patched still
+    built its `Registry` from `paths.state_root()`, and moved its fixture
+    into the developer's real workspace root. `migrate` MOVES data that
+    cannot be recreated, and the five legacy roots it reads
+    (`~/.claude/annotate`, ...) are real directories on a developer's
+    machine -- so the blast radius of one unpatched call is a user's actual
+    sessions, not a stray temp file.
+
+    A test that genuinely means to assert the real default path opts out
+    with `@pytest.mark.real_state_root`, which is loud enough to be noticed
+    in review. Everything else is redirected whether it asked or not.
+    """
+    if request.node.get_closest_marker("real_state_root"):
+        return
+    monkeypatch.setattr(paths, "state_root", lambda: tmp_path / "_state_root")
 
 
 @pytest.fixture
