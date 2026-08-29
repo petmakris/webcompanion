@@ -223,13 +223,16 @@ class UnknownSession(Exception):
     """No registry row matches this kind and sid (or slug)."""
 
 
-def resolve_session_dirs(kind: str, sid: str) -> dict:
+def resolve_session_dirs(kind: str | None, sid: str) -> dict:
     """The directories the daemon actually created for this session.
 
     Reads the daemon's own registry file rather than recomputing a path from
     `Config` -- recomputing cannot tell an existing session from a typo, and
     the function that recomputes (`paths.make_session_dirs`) creates what it
     is asked about. Raises `UnknownSession` when nothing matches.
+
+    `kind` may be None: a sid resolves on its own, and it is only a slug
+    shared by more than one kind that needs disambiguating.
     """
     registry = Registry(paths.state_root())
     registry.rehydrate()

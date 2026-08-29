@@ -136,3 +136,27 @@ def list_versions(threads_dir: Path) -> dict[str, int]:
             if isinstance(anchor, str):
                 out[anchor] = int(t.get("version", 0))
     return out
+
+
+def snapshot(threads_dir: Path) -> dict[str, dict]:
+    """Every thread in this session, keyed by anchor.
+
+    Mirrors `items.snapshot`: one call gets a client everything it needs to
+    render, instead of one request per anchor. A file that will not parse is
+    skipped rather than failing the whole snapshot -- one corrupt thread
+    must not hide the other ninety-four.
+    """
+    threads_dir = Path(threads_dir)
+    if not threads_dir.is_dir():
+        return {}
+    out: dict[str, dict] = {}
+    for p in sorted(threads_dir.iterdir()):
+        if p.suffix != ".json":
+            continue
+        try:
+            t = json.loads(p.read_text())
+        except (json.JSONDecodeError, OSError):
+            continue
+        if isinstance(t, dict) and isinstance(t.get("anchor"), str):
+            out[t["anchor"]] = t
+    return out

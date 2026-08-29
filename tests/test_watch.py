@@ -254,3 +254,59 @@ def test_events_are_emitted_in_filename_order(tmp_path):
 
     assert rc == 0
     assert order == sorted(ids)  # chronological (lexical) order, not insertion order
+
+
+# ── ack: the file watch_loop blocks on, and who writes it ────────────────
+
+def test_an_ack_unblocks_the_loop_instead_of_re_emitting(tmp_path):
+    """Before `webcompanion ack` existed, nothing in the package wrote this
+    file. Every event was emitted, waited out, re-emitted twice, and then
+    reported as WEBCOMPANION_DROPPED -- 90 minutes after the question, with
+    the answer already given."""
+    from webcompanion import events
+    from webcompanion.commands import ack
+
+    state_dir = tmp_path / "state"
+    events_dir = state_dir / "events"
+    consumed_dir = state_dir / "consumed"
+    state_dir.mkdir()
+    event_id = events.append(events_dir, {"anchor": "a", "text": "why?"})
+
+    # The consuming skill answers and acks on the first tick after the
+    # banner, then the session is finished so the loop has somewhere to end.
+    ticks = []
+
+    def sleep(_):
+        ticks.append(1)
+        if len(ticks) == 1:
+            ack.write_ack(consumed_dir, event_id)
+        elif len(ticks) > 2:
+            (state_dir / "finished").touch()
+
+    buf = io.StringIO()
+    rc = run_with_hard_timeout(
+        lambda: watch.watch_loop("annotate", "sid-1", state_dir, events_dir,
+                                  consumed_dir, out=buf, poll_seconds=0.01,
+                                  ack_timeout_seconds=1.0, sleep=sleep))
+
+    assert rc == 0
+    out = buf.getvalue()
+    assert "WEBCOMPANION_FINISHED" in out
+    assert out.count("WEBCOMPANION_EVENT") == 1
+    assert "WEBCOMPANION_DROPPED" not in out
+    assert (consumed_dir / f"{event_id}.json").is_file()  # archived
+
+
+def test_ack_refuses_an_unknown_sid_and_a_path_shaped_event_id(tmp_path, capsys):
+    from webcompanion.commands import ack
+
+    assert ack.run(["--sid", "nope", "--event-id", "e1"]) == 1
+    assert "no such session" in capsys.readouterr().err
+
+    assert ack.run(["--sid", "nope", "--event-id", "../../etc/passwd"]) == 1
+    assert "not a valid event id" in capsys.readouterr().err
+
+
+def test_ack_is_a_registered_subcommand():
+    from webcompanion import cli
+    assert "ack" in cli.SUBCOMMANDS

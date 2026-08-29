@@ -6,8 +6,8 @@ import sys
 from webcompanion import CONTRACT, __version__
 
 SUBCOMMANDS = (
-    "serve", "push", "update", "end", "watch",
-    "install-service", "status", "doctor", "migrate",
+    "serve", "push", "update", "end", "watch", "ack",
+    "install-service", "uninstall", "status", "doctor", "migrate",
 )
 
 

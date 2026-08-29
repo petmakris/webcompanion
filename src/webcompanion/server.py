@@ -53,6 +53,9 @@ _SID_ASSETS_REGISTER_RE = re.compile(r"^/s/([^/]+)/api/assets$")
 _SID_ASSET_RE = re.compile(r"^/s/([^/]+)/assets/(.+)$")
 _SID_UPLOAD_RE = re.compile(r"^/s/([^/]+)/api/upload$")
 _SID_SUBMIT_RE = re.compile(r"^/s/([^/]+)/api/submit$")
+_SID_THREADS_RE = re.compile(r"^/s/([^/]+)/threads$")
+_SID_THREAD_RE = re.compile(r"^/s/([^/]+)/threads/(.+)$")
+_SID_THREAD_DELETE_RE = re.compile(r"^/s/([^/]+)/api/threads/delete$")
 _SID_ROOT_RE = re.compile(r"^/s/([^/]+)/$")
 
 # finished/cancelled are FILES in state_dir, not server memory: the daemon
@@ -81,6 +84,27 @@ def _is_terminal(state_dir: Path) -> bool:
     files a separate watcher process polls; there is no daemon-memory
     shortcut, because a restart must see the same answer the watcher does."""
     return _is_marked(state_dir, _FINISHED_MARKER) or _is_marked(state_dir, _CANCELLED_MARKER)
+
+
+# `webcompanion watch` writes this by atomic rename on every poll. It is a
+# FILE for the same reason finished/cancelled are: the watcher is a separate
+# OS process, so the daemon cannot see its memory and a dict here would
+# report None forever -- which is exactly what /poll did.
+_HEARTBEAT_FILE = "watcher_heartbeat"
+
+
+def _watcher_seen_at(state_dir: Path) -> int | None:
+    """The unix time of the watcher's last heartbeat, or None if no watcher
+    has ever beaten for this session. Never raises: a half-written or
+    hand-edited file reads as "no watcher", not as a 500 from /poll."""
+    try:
+        raw = (Path(state_dir) / _HEARTBEAT_FILE).read_text()
+    except OSError:
+        return None
+    try:
+        return int(raw.strip())
+    except ValueError:
+        return None
 
 
 # Registered renderer roots are a FILE in the session's workspace, not
@@ -149,10 +173,6 @@ class Daemon:
         self.started_at = time.time()
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
-        # watcher_seen_at only — finished/cancelled are files in state_dir,
-        # not server memory (see the module docstring below this class).
-        self._flags: dict[str, dict] = {}
-        self._flags_lock = threading.Lock()
 
     @property
     def url(self) -> str:
@@ -214,20 +234,6 @@ class Daemon:
             self._httpd.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
-
-    # ── watcher_seen_at ──────────────────────────────────────────────────
-    # Unlike finished/cancelled, this is NOT a durability concern in the same
-    # way: it is written by the watcher process (Task 15 owns its shape), and
-    # losing it on a daemon restart just means the next heartbeat re-sets it.
-    _DEFAULT_FLAGS = {"watcher_seen_at": None}
-
-    def init_flags(self, sid: str) -> None:
-        with self._flags_lock:
-            self._flags[sid] = dict(self._DEFAULT_FLAGS)
-
-    def get_flags(self, sid: str) -> dict:
-        with self._flags_lock:
-            return dict(self._flags.get(sid, self._DEFAULT_FLAGS))
 
 
 
@@ -352,6 +358,18 @@ def _make_handler(daemon: Daemon):
                 if resolved is None:
                     return
                 return self._get_item(resolved, dirs, unquote(m.group(2)))
+            m = _SID_THREADS_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._list_threads(dirs)
+            m = _SID_THREAD_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._get_thread(dirs, unquote(m.group(2)))
             m = _SID_ASSET_RE.match(path)
             if m:
                 resolved, dirs = self._session(m.group(1))
@@ -398,6 +416,18 @@ def _make_handler(daemon: Daemon):
                 if resolved is None:
                     return
                 return self._submit(resolved, dirs)
+            m = _SID_THREAD_DELETE_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._delete_thread(resolved, dirs)
+            m = _SID_THREAD_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._append_to_thread(resolved, dirs, unquote(m.group(2)))
             self._text(404, "not found")
 
         def do_PUT(self):
@@ -525,7 +555,6 @@ def _make_handler(daemon: Daemon):
                 cwd, str(payload.get("slug") or ""),
             )
             paths.write_marker(paths.base_of(dirs), sid, kind, cwd)
-            daemon.init_flags(sid)
             # supersede replaces the per-skill class attribute the five
             # servers each set: annotate ends its older sessions for the same
             # cwd, deck does not.
@@ -591,6 +620,68 @@ def _make_handler(daemon: Daemon):
             items.delete(dirs["items_dir"], anchor)
             daemon.registry.note_change(sid)
             self._json(200, {"ok": True})
+
+        # ── threads ─────────────────────────────────────────────────────
+        # The thread store has been ported, tested and flock-serialised
+        # since Task 4, and Task 17 relocated 95 real threads to preserve
+        # them -- but until these four routes existed nothing could read or
+        # append one, while contract 1 already defined a Thread, returned
+        # `threads: {anchor: version}` from /poll, and documented
+        # thread-changed / thread-deleted frames. Adding them after 1.0.0
+        # would have meant a contract bump across four artifacts.
+        def _list_threads(self, dirs: dict) -> None:
+            self._json(200, threads.snapshot(dirs["threads_dir"]))
+
+        def _get_thread(self, dirs: dict, anchor: str) -> None:
+            if not threads.valid_anchor(anchor):
+                self._text(400, "invalid anchor")
+                return
+            # An anchor nobody has commented on yet is not an error: a
+            # client asks for the thread of every region it renders, and a
+            # 404 for each un-commented one would be noise. version 0 with
+            # no messages is the "nothing here yet" answer.
+            self._json(200, threads.load(dirs["threads_dir"], anchor))
+
+        def _append_to_thread(self, sid: str, dirs: dict, anchor: str) -> None:
+            if not self._require_owner():
+                return
+            if not threads.valid_anchor(anchor):
+                self._text(400, "invalid anchor")
+                return
+            payload = self._body()
+            text = payload.get("text")
+            if not isinstance(text, str) or not text.strip():
+                self._text(400, "text is required")
+                return
+            msg = {k: v for k, v in payload.items()
+                   if k not in ("title", "anchor_text")}
+            msg.setdefault("role", "agent")
+            msg.setdefault("ts", int(time.time()))
+            title = payload.get("title")
+            anchor_text = payload.get("anchor_text")
+            if isinstance(anchor_text, str) and anchor_text:
+                threads.set_anchor_text_if_absent(
+                    dirs["threads_dir"], anchor, anchor_text)
+            appended = threads.append_message(
+                dirs["threads_dir"], anchor, msg,
+                title=title if isinstance(title, str) else None)
+            # Bumped whether or not the message was new: anchor_text may
+            # have been set, and a no-op bump costs one SSE wakeup while a
+            # missed one costs a client that never redraws.
+            daemon.registry.note_change(sid)
+            thread = threads.load(dirs["threads_dir"], anchor)
+            self._json(200, {"appended": appended, "version": thread["version"]})
+
+        def _delete_thread(self, sid: str, dirs: dict) -> None:
+            if not self._require_owner():
+                return
+            anchor = self._body().get("anchor")
+            if not isinstance(anchor, str) or not threads.valid_anchor(anchor):
+                self._text(400, "anchor is required and must be a valid anchor")
+                return
+            deleted = threads.delete(dirs["threads_dir"], anchor)
+            daemon.registry.note_change(sid)
+            self._json(200, {"deleted": deleted})
 
         # ── assets and the page ────────────────────────────────────────────
         def _register_assets(self, dirs: dict) -> None:
@@ -710,11 +801,10 @@ def _make_handler(daemon: Daemon):
             if resolved is None:
                 return
             state_dir = Path(dirs["state_dir"])
-            flags = daemon.get_flags(resolved)
             self._json(200, {
                 "finished": _is_marked(state_dir, _FINISHED_MARKER),
                 "cancelled": _is_marked(state_dir, _CANCELLED_MARKER),
-                "watcher_seen_at": flags.get("watcher_seen_at"),
+                "watcher_seen_at": _watcher_seen_at(state_dir),
                 "items": items.versions_of(dirs["items_dir"]),
                 "threads": threads.list_versions(dirs["threads_dir"]),
             })
