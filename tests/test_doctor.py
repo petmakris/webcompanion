@@ -22,8 +22,59 @@ def test_doctor_detects_a_dangling_interpreter(tmp_path, monkeypatch, capsys):
 
 def test_doctor_detects_a_respawn_loop(monkeypatch, capsys):
     monkeypatch.setattr(doctor, "_recent_restart_count", lambda: 40)
+    rc = doctor.run([])
+    out = capsys.readouterr().out.lower()
+    assert rc != 0
+    assert "respawn loop" in out, (
+        "must name the loop specifically -- 'recent restarts: 0' alone "
+        "satisfies a bare 'restart' substring check for any count")
+
+
+def test_doctor_reports_unknown_restart_count_rather_than_a_fabricated_zero(
+        monkeypatch, capsys):
+    """macOS's launchctl has no NRestarts equivalent -- printing 0 when the
+    count is genuinely unknown reads as evidence of health to an operator
+    debugging a respawn loop."""
+    monkeypatch.setattr(doctor, "_recent_restart_count", lambda: None)
     doctor.run([])
-    assert "restart" in capsys.readouterr().out.lower()
+    out = capsys.readouterr().out.lower()
+    assert "unknown" in out
+    assert "recent restarts: 0" not in out
+
+
+def test_doctor_reports_the_resolved_service_python_separately_from_its_own(
+        monkeypatch, capsys):
+    """doctor's own interpreter (sys.executable) is not what launchd would
+    exec -- launchd resolves `/usr/bin/env python3` under a minimal PATH,
+    which can be a different, older python3."""
+    from pathlib import Path
+    monkeypatch.setattr(doctor, "_resolved_service_python",
+                        lambda: (Path("/usr/bin/python3"), (3, 9, 6)))
+    doctor.run([])
+    out = capsys.readouterr().out.lower()
+    assert "/usr/bin/python3" in out
+    assert "3.9.6" in out
+
+
+def test_doctor_fails_when_the_resolved_service_python_is_too_old(wired, monkeypatch, capsys):
+    # `wired` makes every other check pass (real config, real healthy daemon)
+    # so a failure here can only come from the version-floor check itself.
+    from pathlib import Path
+    monkeypatch.setattr(doctor, "_resolved_service_python",
+                        lambda: (Path("/usr/bin/python3"), (3, 8, 10)))
+    rc = doctor.run([])
+    out = capsys.readouterr().out.lower()
+    assert rc != 0
+    assert "3.8.10" in out
+    assert "below" in out
+
+
+def test_doctor_fails_when_no_service_python_can_be_resolved(monkeypatch, capsys):
+    monkeypatch.setattr(doctor, "_resolved_service_python", lambda: None)
+    rc = doctor.run([])
+    out = capsys.readouterr().out.lower()
+    assert rc != 0
+    assert "not found" in out
 
 
 def test_doctor_reports_a_healthy_daemon(wired, capsys):

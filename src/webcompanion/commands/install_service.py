@@ -17,6 +17,7 @@ this command is meant to be re-run on every upgrade.
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import string
@@ -109,9 +110,40 @@ def build_zipapp(dest: Path) -> Path:
     return dest
 
 
+class ConfigUnreadable(Exception):
+    """A config file exists at `path` but could not be parsed.
+
+    Deliberately distinct from "no config file": `config.load()` tolerates
+    a corrupt file by returning bare defaults, which is right for a read
+    path, but `ensure_config` minting a fresh token over it would silently
+    discard the write token an IDE plugin is already using -- and every
+    other setting -- dressing a disk error up as a first install.
+    """
+
+    def __init__(self, path: Path, reason: str):
+        super().__init__(f"{path} exists but could not be read: {reason}")
+        self.path = path
+        self.reason = reason
+
+
 def ensure_config() -> Config:
-    """The config, minting a token only if the existing one is empty."""
+    """The config, minting a token only if there truly is none.
+
+    Raises `ConfigUnreadable` -- and mints nothing, writes nothing -- if a
+    config file is present but unparseable. Only a genuinely absent file is
+    treated as "first install".
+    """
     path = cfgmod.config_path()
+    if path.exists():
+        try:
+            raw = json.loads(path.read_text())
+        except OSError as e:
+            raise ConfigUnreadable(path, str(e)) from e
+        except json.JSONDecodeError as e:
+            raise ConfigUnreadable(path, f"invalid JSON: {e}") from e
+        if not isinstance(raw, dict):
+            raise ConfigUnreadable(path, "not a JSON object")
+
     cfg = cfgmod.load(path)
     if not cfg.token:
         cfg.token = cfgmod.mint_token()
@@ -156,8 +188,15 @@ def run(argv: list[str], *, target_dir: Path | None = None,
     the real CLI), this writes to the real launchd/systemd locations and
     actually loads the service.
     """
+    try:
+        ensure_config()
+    except ConfigUnreadable as e:
+        print(f"webcompanion: {e}\n"
+              f"  fix or delete {e.path}, then re-run install-service",
+              file=sys.stderr)
+        return 1
+
     pyz = build_zipapp(default_zipapp_path())
-    ensure_config()
 
     log_dir = paths.state_root()
     system = "darwin" if sys.platform == "darwin" else "linux"

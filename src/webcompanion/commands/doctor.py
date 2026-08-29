@@ -79,29 +79,73 @@ def _service_interpreter() -> Path | None:
     return Path(first)
 
 
-def _recent_restart_count() -> int:
-    """Best-effort restart count for the installed service. systemd exposes
-    this directly (`NRestarts`); macOS's `launchctl` does not expose an
-    equivalent without the service actually being installed and inspected
-    live, so this reports 0 on macOS -- see the task report for what is and
-    is not verifiable without installing a real service."""
+def _recent_restart_count() -> int | None:
+    """Restart count for the installed service, or None when it genuinely
+    cannot be known. systemd exposes this directly (`NRestarts`); macOS's
+    `launchctl` has no equivalent without the service being installed and
+    inspected live -- see the task report for what is and is not verifiable
+    without installing a real service. None must never be reported as 0: a
+    fabricated zero reads as evidence of health to an operator debugging a
+    respawn loop."""
     systemctl = shutil.which("systemctl")
     if not systemctl:
-        return 0
+        return None
     try:
         out = subprocess.run(
             [systemctl, "--user", "show", DEFAULT_SERVICE_NAME, "-p", "NRestarts"],
             capture_output=True, text=True, timeout=3,
         ).stdout
     except (OSError, subprocess.SubprocessError):
-        return 0
+        return None
     for line in out.splitlines():
         if line.startswith("NRestarts="):
             try:
                 return int(line.split("=", 1)[1])
             except ValueError:
-                return 0
-    return 0
+                return None
+    return None
+
+
+# The minimum Python this package supports (see pyproject.toml).
+MIN_PYTHON = (3, 9)
+
+# launchd's actual default job environment -- NOT the interactive shell's
+# PATH, which is exactly the point: a Homebrew python3 on Apple Silicon
+# lives in /opt/homebrew/bin, reachable from an interactive shell via
+# `brew shellenv` but NOT from this minimal launchd/systemd PATH, so
+# `/usr/bin/env python3` inside the actual service can resolve to a
+# completely different, possibly older, interpreter than the one running
+# doctor. Resolving it for real -- not guessing -- is what catches that
+# drift before it becomes a respawn loop with nothing saying why.
+_SERVICE_PATH = "/usr/bin:/bin:/usr/sbin:/sbin"
+
+
+def _resolved_service_python() -> tuple[Path, tuple[int, ...]] | None:
+    """What `/usr/bin/env python3` actually resolves to under launchd's
+    minimal PATH -- not `sys.executable`, which is whatever interpreter
+    doctor itself happens to be running on. Returns (path, version) or None
+    if no python3 can be found there at all."""
+    env_bin = shutil.which("env") or "/usr/bin/env"
+    try:
+        proc = subprocess.run(
+            [env_bin, "python3", "-c",
+             "import sys; print(sys.executable); "
+             "print('.'.join(map(str, sys.version_info[:3])))"],
+            capture_output=True, text=True, timeout=5,
+            env={"PATH": _SERVICE_PATH},
+        )
+    except (OSError, subprocess.SubprocessError):
+        return None
+    if proc.returncode != 0:
+        return None
+    lines = proc.stdout.strip().splitlines()
+    if len(lines) < 2:
+        return None
+    try:
+        version = tuple(int(x) for x in lines[1].split("."))
+    except ValueError:
+        return None
+    return Path(lines[0]), version
 
 
 def _health() -> dict | None:
@@ -125,7 +169,25 @@ def _sweep_failure_marker() -> dict | None:
 def run(argv: list[str]) -> int:
     ok = True
 
-    print(f"python3: {sys.executable} ({platform.python_version()})")
+    print(f"python3 (running doctor): {sys.executable} ({platform.python_version()})")
+
+    resolved = _resolved_service_python()
+    if resolved is None:
+        ok = False
+        print(f"python3 (via /usr/bin/env, the service's minimal PATH): "
+              f"NOT FOUND -- the service would fail to exec")
+    else:
+        svc_path, svc_version = resolved
+        svc_version_str = ".".join(map(str, svc_version))
+        if svc_version[:2] < MIN_PYTHON:
+            ok = False
+            min_str = ".".join(map(str, MIN_PYTHON))
+            print(f"python3 (via /usr/bin/env, the service's minimal PATH): "
+                  f"{svc_path} ({svc_version_str}) -- BELOW the required "
+                  f"{min_str}; the service will fail to exec")
+        else:
+            print(f"python3 (via /usr/bin/env, the service's minimal PATH): "
+                  f"{svc_path} ({svc_version_str})")
 
     cfg_path = cfgmod.config_path()
     if not cfg_path.exists():
@@ -155,11 +217,15 @@ def run(argv: list[str]) -> int:
         print(f"service interpreter: {interp} (present)")
 
     restarts = _recent_restart_count()
-    print(f"recent restarts: {restarts}")
-    if restarts >= RESTART_LOOP_THRESHOLD:
-        ok = False
-        print(f"  warning: {restarts} restarts recently -- looks like a "
-              f"respawn loop; check the log")
+    if restarts is None:
+        print("recent restarts: unknown (launchctl does not expose a "
+              "restart count)")
+    else:
+        print(f"recent restarts: {restarts}")
+        if restarts >= RESTART_LOOP_THRESHOLD:
+            ok = False
+            print(f"  warning: {restarts} restarts recently -- looks like a "
+                  f"respawn loop; check the log")
 
     health = _health()
     if health is None:
