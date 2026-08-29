@@ -3,7 +3,11 @@ from __future__ import annotations
 import threading
 
 from webcompanion import CONTRACT, __version__
+from webcompanion.config import Config, mint_token
 from webcompanion.gate import CONTRACT_HEADER
+from webcompanion.server import Daemon
+
+from conftest import raw_call
 
 
 def test_health_reports_contract_and_version(call):
@@ -73,6 +77,60 @@ def test_cancel_marks_the_session(call):
     assert call("POST", f"/s/{s['sid']}/api/cancel")[0] == 200
     _, poll = call("GET", f"/s/{s['sid']}/poll")
     assert poll["cancelled"] is True
+
+
+def test_finished_survives_a_daemon_restart(tmp_path):
+    # This is the test whose absence let a Critical through: finished state
+    # was kept in a server-side dict, so an upgrade-triggered restart of the
+    # always-on daemon resurrected every finished session, and Task 15's
+    # watcher process (which polls state_dir for a `finished` file, not this
+    # process's memory) would never have seen it end.
+    cfg = Config(port=0, token=mint_token(), bind="127.0.0.1",
+                 workspace_root=tmp_path / "ws")
+    state_root = tmp_path / "state"
+
+    d1 = Daemon(cfg, state_root=state_root)
+    d1.start()
+    try:
+        _, s = raw_call(d1, "POST", "/api/sessions",
+                        {"kind": "annotate", "cwd": "/p", "title": "T"})
+        assert raw_call(d1, "POST", f"/s/{s['sid']}/api/finish")[0] == 200
+        _, poll = raw_call(d1, "GET", f"/s/{s['sid']}/poll")
+        assert poll["finished"] is True
+    finally:
+        d1.stop()
+
+    d2 = Daemon(cfg, state_root=state_root)
+    d2.start()
+    try:
+        _, poll = raw_call(d2, "GET", f"/s/{s['sid']}/poll")
+        assert poll["finished"] is True
+    finally:
+        d2.stop()
+
+
+def test_supersede_ends_the_older_session_of_the_same_kind_and_cwd(call):
+    _, older = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "Old"})
+    _, newer = call("POST", "/api/sessions",
+                    {"kind": "annotate", "cwd": "/p", "title": "New", "supersede": True})
+    _, poll_older = call("GET", f"/s/{older['sid']}/poll")
+    _, poll_newer = call("GET", f"/s/{newer['sid']}/poll")
+    assert poll_older["finished"] is True
+    assert poll_newer["finished"] is False
+
+
+def test_supersede_leaves_other_kinds_and_cwds_alone(call):
+    # Supersede replaces a per-skill setting where one client (annotate) ends
+    # its older sessions and another (deck) deliberately does not. Scoping it
+    # too broadly would silently end a user's unrelated work.
+    _, other_kind = call("POST", "/api/sessions", {"kind": "deck", "cwd": "/p", "title": "D"})
+    _, other_cwd = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/q", "title": "Q"})
+    call("POST", "/api/sessions",
+        {"kind": "annotate", "cwd": "/p", "title": "New", "supersede": True})
+    _, poll_kind = call("GET", f"/s/{other_kind['sid']}/poll")
+    _, poll_cwd = call("GET", f"/s/{other_cwd['sid']}/poll")
+    assert poll_kind["finished"] is False
+    assert poll_cwd["finished"] is False
 
 
 def test_an_unknown_session_is_a_404(call):

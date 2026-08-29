@@ -24,6 +24,7 @@ from urllib.parse import parse_qs, urlsplit
 
 from webcompanion import CONTRACT, __version__
 from webcompanion import anchors, events, gate, items, paths, threads, uploads
+from webcompanion.atomic import write_text_atomic
 from webcompanion.config import Config
 from webcompanion.registry import Registry
 
@@ -39,6 +40,22 @@ _SID_POLL_RE = re.compile(r"^/s/([^/]+)/poll$")
 _SID_FINISH_RE = re.compile(r"^/s/([^/]+)/api/finish$")
 _SID_CANCEL_RE = re.compile(r"^/s/([^/]+)/api/cancel$")
 
+# finished/cancelled are FILES in state_dir, not server memory: the daemon
+# restarts on every package upgrade, and Task 15's watcher (and Task 12's
+# stream.serve is_terminal check) run as a SEPARATE process that polls the
+# filesystem, not this process's memory. A dict here would resurrect every
+# finished session on restart and would be invisible to that watcher.
+_FINISHED_MARKER = "finished"
+_CANCELLED_MARKER = "cancelled"
+
+
+def _mark(state_dir: Path, name: str) -> None:
+    write_text_atomic(Path(state_dir) / name, "")
+
+
+def _is_marked(state_dir: Path, name: str) -> bool:
+    return (Path(state_dir) / name).exists()
+
 
 class Daemon:
     def __init__(self, cfg: Config, state_root: Path | None = None):
@@ -48,10 +65,8 @@ class Daemon:
         self.started_at = time.time()
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
-        # Finish/cancel/poll state. This is server-level, not registry state:
-        # the registry only knows identity and directories, and exposes no
-        # setter for arbitrary meta — deliberately, since sid/slug/kind/cwd
-        # are the only things every kind agrees mean the same thing.
+        # watcher_seen_at only — finished/cancelled are files in state_dir,
+        # not server memory (see the module docstring below this class).
         self._flags: dict[str, dict] = {}
         self._flags_lock = threading.Lock()
 
@@ -81,24 +96,15 @@ class Daemon:
         if self._thread is not None:
             self._thread.join(timeout=5)
 
-    # ── finish / cancel / poll state ────────────────────────────────────
-    _DEFAULT_FLAGS = {"finished": False, "cancelled": False, "watcher_seen_at": None}
+    # ── watcher_seen_at ──────────────────────────────────────────────────
+    # Unlike finished/cancelled, this is NOT a durability concern in the same
+    # way: it is written by the watcher process (Task 15 owns its shape), and
+    # losing it on a daemon restart just means the next heartbeat re-sets it.
+    _DEFAULT_FLAGS = {"watcher_seen_at": None}
 
     def init_flags(self, sid: str) -> None:
         with self._flags_lock:
             self._flags[sid] = dict(self._DEFAULT_FLAGS)
-
-    def set_finished(self, sid: str) -> None:
-        with self._flags_lock:
-            self._flags.setdefault(sid, dict(self._DEFAULT_FLAGS))
-            self._flags[sid]["finished"] = True
-        self.registry.note_change(sid)
-
-    def set_cancelled(self, sid: str) -> None:
-        with self._flags_lock:
-            self._flags.setdefault(sid, dict(self._DEFAULT_FLAGS))
-            self._flags[sid]["cancelled"] = True
-        self.registry.note_change(sid)
 
     def get_flags(self, sid: str) -> dict:
         with self._flags_lock:
@@ -234,27 +240,35 @@ def _make_handler(daemon: Daemon):
             self._json(200, rows)
 
         def _poll(self, sid: str) -> None:
-            resolved, _ = self._session(sid)
+            resolved, dirs = self._session(sid)
             if resolved is None:
                 return
-            self._json(200, daemon.get_flags(resolved))
+            state_dir = Path(dirs["state_dir"])
+            flags = daemon.get_flags(resolved)
+            self._json(200, {
+                "finished": _is_marked(state_dir, _FINISHED_MARKER),
+                "cancelled": _is_marked(state_dir, _CANCELLED_MARKER),
+                "watcher_seen_at": flags.get("watcher_seen_at"),
+            })
 
         def _finish(self, sid: str) -> None:
             if not self._require_owner():
                 return
-            resolved, _ = self._session(sid)
+            resolved, dirs = self._session(sid)
             if resolved is None:
                 return
-            daemon.set_finished(resolved)
+            _mark(Path(dirs["state_dir"]), _FINISHED_MARKER)
+            daemon.registry.note_change(resolved)
             self._json(200, {"ok": True})
 
         def _cancel(self, sid: str) -> None:
             if not self._require_owner():
                 return
-            resolved, _ = self._session(sid)
+            resolved, dirs = self._session(sid)
             if resolved is None:
                 return
-            daemon.set_cancelled(resolved)
+            _mark(Path(dirs["state_dir"]), _CANCELLED_MARKER)
+            daemon.registry.note_change(resolved)
             self._json(200, {"ok": True})
 
         def _supersede_siblings(self, kind: str, cwd: str, sid: str) -> None:
@@ -263,12 +277,15 @@ def _make_handler(daemon: Daemon):
             Per-request, not a class attribute: this is what replaces the
             per-skill class flag the five servers each set (annotate ends
             its older sessions, deck does not) with one payload field any
-            caller can opt into.
+            caller can opt into. Scoped to BOTH kind and cwd: a session of a
+            different kind, or the same kind in a different cwd, must be
+            left alone, or this would silently end a user's unrelated work.
             """
-            for other_sid, _ in daemon.registry.find(cwd=cwd, kind=kind):
+            for other_sid, other_dirs in daemon.registry.find(cwd=cwd, kind=kind):
                 if other_sid == sid:
                     continue
-                daemon.set_finished(other_sid)
+                _mark(Path(other_dirs["state_dir"]), _FINISHED_MARKER)
+                daemon.registry.note_change(other_sid)
 
         def _create_session(self) -> None:
             if not self._require_owner():
