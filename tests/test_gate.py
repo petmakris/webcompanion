@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import inspect
+
 import pytest
 
 from webcompanion import CONTRACT, gate
@@ -109,3 +111,14 @@ def test_a_junk_contract_header_is_a_mismatch_not_a_crash():
     h = FakeHandler()
     h.headers[gate.CONTRACT_HEADER] = "banana"
     assert gate.check_contract(h)[0] is False
+
+
+def test_token_comparison_uses_compare_digest_not_equality():
+    # A timing attack isn't practical to demonstrate in a unit test, so this
+    # is a structural check: the token check must go through
+    # secrets.compare_digest, not `==`, or a wrong guess doesn't take
+    # constant time relative to a right one.
+    source = inspect.getsource(gate.is_owner)
+    assert "secrets.compare_digest(" in source
+    assert "presented == token" not in source
+
