@@ -20,8 +20,7 @@ def test_defaults_when_no_file(tmp_path):
 def test_write_then_load_roundtrips(tmp_path):
     p = tmp_path / "config.json"
     cfg = cfgmod.Config(port=3999, token="abc", bind="127.0.0.1",
-                        retention_days=30, workspace_root=tmp_path / "ws",
-                        public_host=None)
+                        retention_days=30, workspace_root=tmp_path / "ws")
     cfgmod.write(cfg, p)
     back = cfgmod.load(p)
     assert back.port == 3999

@@ -20,10 +20,30 @@ every client kind that talks to it.
   a `slug` (short human-readable id, unique within its kind), a `kind`
   (which client feature created it — see below), a `cwd` (the project
   directory it belongs to), and a small metadata bag.
-- **Kind** — a short string naming which client feature owns a session
-  (for example `annotate`, `deck`, `dataflow`). Kinds partition storage and
-  slug uniqueness: two kinds may both use the slug `my-plan` without
-  colliding. A kind must match `^[a-z][a-z0-9_-]{0,63}$`.
+- **Kind** — a short string naming which client feature owns a session.
+  Kinds partition storage and slug uniqueness: two kinds may both use the
+  slug `my-plan` without colliding. A kind must match
+  `^[a-z][a-z0-9_-]{0,63}$`.
+
+  A kind is a free-form string as far as the daemon is concerned, but the
+  five that exist have ONE canonical spelling each, and a client that pushes
+  a different one gets a separate, invisible partition rather than an error.
+  They are, exactly:
+
+  ```
+  annotate
+  deck
+  dataflow
+  walkthrough
+  interactive-review
+  ```
+
+  Note the hyphen in `interactive-review`. `webcompanion migrate` derives a
+  kind from the old per-skill directory name, so a session migrated from
+  `~/.claude/interactive_review` arrives as `interactive_review` with an
+  underscore. Those are two different kinds to the daemon. A client whose
+  sessions predate the migration should query both and treat the hyphenated
+  form as canonical for anything it creates.
 - **Item** — one opaque JSON body addressed by a client-chosen string
   called an **anchor**. The daemon never inspects an item's shape; it
   stores the body, derives a version from its content hash, and hands both
@@ -130,11 +150,21 @@ POST   /s/{sid}/api/assets
 GET    /s/{sid}/assets/<relpath>
 POST   /s/{sid}/api/upload
 POST   /s/{sid}/api/submit
+GET    /s/{sid}/threads
+GET    /s/{sid}/threads/<anchor>
+POST   /s/{sid}/threads/<anchor>
+POST   /s/{sid}/api/threads/delete
 POST   /s/{sid}/api/finish
 POST   /s/{sid}/api/cancel
 ```
 
-`{sid}` is a session id or (within one `kind`, unambiguously) its slug.
+`{sid}` is a session id or its slug. A slug is unique **within a kind**,
+not across kinds, so the same slug can name a session in `annotate`, in
+`deck` and in `dataflow` at once. Add `?kind=<kind>` to any session-scoped
+route to say which you mean. Without it, a slug matching exactly one live
+session resolves; a slug matching more than one is `409` with a body naming
+the candidate kinds (never `404`, which would read as "it is gone" for
+something that exists three times over).
 `<anchor>` and `<relpath>` are the last, free-form segment of their path —
 an anchor may itself contain characters that look like path separators
 once URL-decoded. **write** means the ownership check applies.
@@ -158,9 +188,13 @@ once URL-decoded. **write** means the ownership check applies.
 | POST | `/s/{sid}/api/assets` | write | Register a renderer for this session's shell page. Body: `{static_root, entry?}`. `static_root` must resolve to an existing directory; `entry`, if given, is the script tag written into the shell page. Registration is a file in the session's own workspace, not daemon memory, so it survives the daemon's own restarts. |
 | GET | `/s/{sid}/assets/<relpath>` | | Serve a file from the registered `static_root`, containment-checked against symlink escapes. `404 no renderer registered for this session` if nothing has registered yet; `403 forbidden` on an escape attempt; `404 no such asset` otherwise. |
 | POST | `/s/{sid}/api/upload` | write | Upload a pasted image. Body is the raw image bytes; `Content-Type` must be one of `image/png`, `image/jpeg`, `image/gif`, `image/webp`. `413` past 10 MB, `415` on an unrecognized type, `411` if `Content-Length` is missing. Returns `200 {path, size}`. |
-| POST | `/s/{sid}/api/submit` | write | Submit a comment/interaction event on an anchor. Body: `{anchor, text, images?}` — `images`, if given, must be paths this same session's own `/api/upload` produced. `400` on a missing/invalid anchor or empty text. Returns `202 {event_id}` — the event is queued for a separate watcher process to consume, not answered synchronously. |
+| POST | `/s/{sid}/api/submit` | write | Submit a comment/interaction event on an anchor. Body: `{anchor, text, images?}` — `images`, if given, must be paths this same session's own `/api/upload` produced. `400` on a missing/invalid anchor or empty text. Returns `202 {event_id}` — the event is queued for a separate watcher process to consume, not answered synchronously. **Whoever answers the event must acknowledge it**, or the watcher re-emits it (3 attempts, 30 minutes apart) and then drops it: run `webcompanion ack --sid <sid> --event-id <event_id>` on the daemon's own host. There is no HTTP route for the acknowledgement — the queue and the ack are files in the session's workspace, and the only consumer runs beside the daemon. |
+| GET | `/s/{sid}/threads` | | Snapshot of every thread: `{anchor: {anchor, version, messages, title?, anchor_text?}}`. |
+| GET | `/s/{sid}/threads/<anchor>` | | One thread. An anchor nobody has commented on is **not** a `404` — it comes back as `{anchor, version: 0, messages: []}`, because a client asks for the thread of every region it renders and a 404 per un-commented region is noise. `400` if the anchor is invalid. |
+| POST | `/s/{sid}/threads/<anchor>` | write | Append one message. Body: `{text, role?, source_event_id?, title?, anchor_text?}` plus any other keys you want stored on the message. `text` is required and non-empty (`400` otherwise). `role` defaults to `agent`; `ts` (unix seconds) is stamped server-side. `source_event_id` makes the append **idempotent** — a second POST carrying an id already in the thread returns `{appended: false}` and changes nothing, which is what makes the watcher's re-emission safe. `title` is thread-level and last-write-wins; `anchor_text` is thread-level and first-write-wins. Returns `200 {appended, version}`. |
+| POST | `/s/{sid}/api/threads/delete` | write | Delete one thread. Body: `{anchor}`. Returns `200 {deleted: bool}` — `false` simply means there was nothing there. A POST rather than a DELETE because the anchor travels in the body: an anchor may contain characters that look like path separators. |
 | POST | `/s/{sid}/api/finish` | write | Mark the session finished. Ends its SSE streams (a `session-ended` frame, then close). |
-| POST | `/s/{sid}/api/cancel` | write | Mark the session cancelled. Same effect on streams as finish; the two states are reported separately in `/poll` and `/health`. |
+| POST | `/s/{sid}/api/cancel` | write | Mark the session cancelled. Same effect on streams as finish; the two states are reported separately by `/poll`, as `finished` and `cancelled`. `/health` reports neither — it counts sessions and says nothing about their state. |
 
 Every session-scoped route resolves `{sid}` against the daemon's registry
 first; an unresolvable id or slug is `404 no such session` for every one
@@ -190,6 +224,11 @@ inside the event stream.
 
 - **`403 forbidden`** — the caller is not the owner. Only returned from
   routes marked **write** above (plus `GET /api/sessions?scope=all`).
+- **`409 Conflict`** — an ambiguous slug: it names a live session in more
+  than one `kind`. The body lists the kinds; retry with `?kind=<kind>`.
+- **`408 Request Timeout`** — only from `/s/{sid}/api/upload`: the declared
+  `Content-Length` did not arrive within 30 seconds. The daemon will not
+  hold a thread for a client that stops sending.
 - **`404`** — either "no such session" (an unresolvable `{sid}`/slug), "no
   such item", "no such asset", or "no such file" (from `/api/open`),
   distinguished by the response body text.

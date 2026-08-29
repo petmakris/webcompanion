@@ -241,3 +241,84 @@ def test_there_is_no_idle_shutdown(daemon):
     assert "threading.Timer" not in source
     assert "idle_timeout" not in source
     assert "idle-timeout" not in source
+
+
+# ── an ambiguous slug is 409 with the candidates, never 404 ──────────────
+
+def test_a_slug_used_by_three_kinds_answers_409_naming_them(call, tmp_path):
+    """Real in the user's own data: `montblanc` exists in three kinds.
+
+    Slugs are unique WITHIN a kind by design, so this is not a collision to
+    prevent -- it is one to answer. `resolve` returns None for it, which
+    surfaced as `404 no such session`: a status that reads as "it is gone"
+    about something that exists three times over.
+    """
+    for kind in ("annotate", "deck", "dataflow"):
+        call("POST", "/api/sessions",
+             {"kind": kind, "cwd": str(tmp_path), "slug": "montblanc"})
+
+    status, body = call("GET", "/s/montblanc/items")
+    assert status == 409
+    assert "annotate" in body and "deck" in body and "dataflow" in body
+    assert "?kind=" in body
+
+
+def test_the_kind_query_disambiguates_a_shared_slug(call, tmp_path):
+    ids = {}
+    for kind in ("annotate", "deck"):
+        _, created = call("POST", "/api/sessions",
+                          {"kind": kind, "cwd": str(tmp_path), "slug": "montblanc"})
+        ids[kind] = created["sid"]
+    call("PUT", f"/s/{ids['deck']}/items/only-in-deck", {"text": "x"})
+
+    status, body = call("GET", "/s/montblanc/items?kind=deck")
+    assert status == 200
+    assert set(body) == {"only-in-deck"}
+
+    assert call("GET", "/s/montblanc/items?kind=annotate")[1] == {}
+
+
+def test_an_unambiguous_slug_still_resolves_without_a_kind(call, tmp_path):
+    """The negative control: 409 must not become the answer for every
+    slug."""
+    call("POST", "/api/sessions",
+         {"kind": "annotate", "cwd": str(tmp_path), "slug": "solo"})
+    assert call("GET", "/s/solo/items")[0] == 200
+
+
+def test_a_slug_nobody_uses_is_still_404(call):
+    status, body = call("GET", "/s/never-existed/items")
+    assert status == 404
+    assert "no such session" in body
+
+
+# ── a session row with no cwd ────────────────────────────────────────────
+
+def test_an_item_in_a_session_with_no_cwd_is_400_not_a_500(daemon, call, tmp_path):
+    """`dirs["_cwd"]` raised KeyError inside the handler for a malformed
+    row -- a 500 with a traceback for what is bad input. And an EMPTY _cwd
+    was worse than an error: Path("").resolve() is the daemon's own cwd
+    ("/" under launchd), and is_relative_to("/") is true for every path on
+    the machine, so anchor containment silently passed for anything the
+    daemon could read."""
+    _, created = call("POST", "/api/sessions",
+                      {"kind": "annotate", "cwd": str(tmp_path)})
+    sid = created["sid"]
+    call("PUT", f"/s/{sid}/items/a", {"text": "x"})
+    daemon.registry.lookup(sid)["_cwd"] = ""
+
+    status, body = call("GET", f"/s/{sid}/items/a")
+    assert status == 400
+    assert "workspace root" in body
+
+
+def test_an_empty_root_refuses_every_code_anchor(tmp_path):
+    """The containment check itself, below the route: an empty root must
+    resolve nothing, not everything."""
+    from webcompanion import anchors
+
+    body = {"code": [{"file": "etc/passwd", "line": 1, "snippet": "root:"}]}
+    for root in ("", "   ", None):
+        resolved = anchors.resolve_all(body, root)
+        assert resolved and resolved[0]["status"] == "refused"
+        assert "no workspace root" in resolved[0]["message"]

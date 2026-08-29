@@ -39,4 +39,4 @@ markers = [
 where = ["src"]
 
 [tool.setuptools.package-data]
-webcompanion = ["static/*", "service/*"]
+webcompanion = ["static/*", "service/*", "py.typed"]
