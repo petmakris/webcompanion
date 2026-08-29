@@ -5,12 +5,24 @@ from webcompanion.server import Daemon
 
 from conftest import raw_call
 
-# Two tests from the brief are deliberately absent here:
-#   test_the_runtime_is_served_by_the_daemon
-#   test_the_shell_page_loads_the_runtime_and_the_registered_entry
-# Both need static files (core.js, shell.html) that Task 13 creates. Writing
-# them now, or creating placeholder static files to pass them, would be
-# testing a file this task does not own.
+def test_the_runtime_is_served_by_the_daemon(call):
+    status, body = call("GET", "/_wc/core.js")
+    assert status == 200
+    assert "WebCompanion" in body
+
+
+def test_the_shell_page_loads_the_runtime_and_the_registered_entry(tmp_path, call):
+    bundle = tmp_path / "bundle"
+    bundle.mkdir()
+    (bundle / "app.js").write_text("console.log('renderer')")
+    s = call("POST", "/api/sessions",
+             {"kind": "annotate", "cwd": "/p", "title": "T"})[1]
+    assert call("POST", f"/s/{s['sid']}/api/assets",
+                {"static_root": str(bundle), "entry": "app.js"})[0] == 200
+    status, html = call("GET", f"/s/{s['sid']}/")
+    assert status == 200
+    assert "/_wc/core.js" in html
+    assert "assets/app.js" in html
 
 
 def test_a_client_registers_its_own_renderer_and_it_is_served(tmp_path, call):
