@@ -7,7 +7,7 @@ replaced.
 """
 from __future__ import annotations
 
-__version__ = "0.1.0"
+__version__ = "1.0.0"
 
 # The HTTP contract version. Bumped ONLY on a breaking change to routes or
 # payload shapes. Clients send it in X-WebCompanion-Contract; a mismatch is

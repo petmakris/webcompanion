@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "webcompanion"
-version = "0.1.0"
+version = "1.0.0"
 description = "A local always-on companion server: addressable items, comment threads, and an event queue."
 readme = "README.md"
 requires-python = ">=3.9"
@@ -12,7 +12,10 @@ license = {text = "MIT"}
 authors = [{name = "Petros Makris"}]
 dependencies = []
 classifiers = [
+  "Development Status :: 5 - Production/Stable",
+  "License :: OSI Approved :: MIT License",
   "Programming Language :: Python :: 3.9",
+  "Programming Language :: Python :: 3.13",
   "Operating System :: MacOS",
   "Operating System :: POSIX :: Linux",
 ]
