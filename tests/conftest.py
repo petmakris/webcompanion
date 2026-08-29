@@ -50,3 +50,14 @@ def call(daemon):
     def _call(method, path, body=None, headers=None, expect=None):
         return raw_call(daemon, method, path, body=body, headers=headers)
     return _call
+
+
+@pytest.fixture
+def wired(daemon, tmp_path, monkeypatch):
+    """Point the CLI at the test daemon, not the real config file."""
+    from webcompanion import config as cfgmod
+    p = tmp_path / "config.json"
+    cfgmod.write(cfgmod.Config(port=int(daemon.url.rsplit(":", 1)[1]),
+                               token=daemon.cfg.token), p)
+    monkeypatch.setattr(cfgmod, "config_path", lambda: p)
+    return daemon
