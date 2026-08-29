@@ -15,12 +15,16 @@ Deliberately absent, and each absence is load-bearing:
 from __future__ import annotations
 
 import json
+import mimetypes
 import re
+import shutil
+import subprocess
+import sys
 import threading
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
-from urllib.parse import parse_qs, urlsplit
+from urllib.parse import parse_qs, unquote, urlsplit
 
 from webcompanion import CONTRACT, __version__
 from webcompanion import anchors, events, gate, items, paths, threads, uploads
@@ -39,6 +43,13 @@ BANNER = f"webcompanion v{__version__}"
 _SID_POLL_RE = re.compile(r"^/s/([^/]+)/poll$")
 _SID_FINISH_RE = re.compile(r"^/s/([^/]+)/api/finish$")
 _SID_CANCEL_RE = re.compile(r"^/s/([^/]+)/api/cancel$")
+_SID_ITEMS_RE = re.compile(r"^/s/([^/]+)/items$")
+_SID_ITEM_RE = re.compile(r"^/s/([^/]+)/items/(.+)$")
+_SID_ASSETS_REGISTER_RE = re.compile(r"^/s/([^/]+)/api/assets$")
+_SID_ASSET_RE = re.compile(r"^/s/([^/]+)/assets/(.+)$")
+_SID_UPLOAD_RE = re.compile(r"^/s/([^/]+)/api/upload$")
+_SID_SUBMIT_RE = re.compile(r"^/s/([^/]+)/api/submit$")
+_SID_ROOT_RE = re.compile(r"^/s/([^/]+)/$")
 
 # finished/cancelled are FILES in state_dir, not server memory: the daemon
 # restarts on every package upgrade, and Task 15's watcher (and Task 12's
@@ -57,6 +68,20 @@ def _is_marked(state_dir: Path, name: str) -> bool:
     return (Path(state_dir) / name).exists()
 
 
+def _editor_command(target: Path, line: int | None) -> list[str]:
+    """Ported from skills/_shared/web_companion/server.py:897 unchanged: an
+    IDE launcher wins when present (and takes a line number), otherwise the
+    platform's generic file opener."""
+    launcher = shutil.which("idea")
+    if launcher and line:
+        return [launcher, "--line", str(line), str(target)]
+    if launcher:
+        return [launcher, str(target)]
+    if sys.platform == "darwin":
+        return ["open", str(target)]
+    return ["xdg-open", str(target)]
+
+
 class Daemon:
     def __init__(self, cfg: Config, state_root: Path | None = None):
         self.cfg = cfg
@@ -69,6 +94,12 @@ class Daemon:
         # not server memory (see the module docstring below this class).
         self._flags: dict[str, dict] = {}
         self._flags_lock = threading.Lock()
+        # A registered renderer root, per session. Not persisted: it is the
+        # client re-announcing "here is my static bundle" on every session
+        # it opens, so losing it on a restart just means the next page load
+        # re-registers it -- same shape as watcher_seen_at above.
+        self._assets: dict[str, dict] = {}
+        self._assets_lock = threading.Lock()
 
     @property
     def url(self) -> str:
@@ -110,6 +141,16 @@ class Daemon:
         with self._flags_lock:
             return dict(self._flags.get(sid, self._DEFAULT_FLAGS))
 
+    # ── registered renderer roots ────────────────────────────────────────
+    def set_asset_root(self, sid: str, root: str, entry: str | None) -> None:
+        with self._assets_lock:
+            self._assets[sid] = {"root": root, "entry": entry}
+
+    def get_asset_root(self, sid: str) -> dict | None:
+        with self._assets_lock:
+            info = self._assets.get(sid)
+            return dict(info) if info is not None else None
+
 
 def _make_handler(daemon: Daemon):
     class Handler(BaseHTTPRequestHandler):
@@ -132,6 +173,27 @@ def _make_handler(daemon: Daemon):
             data = body.encode("utf-8")
             self.send_response(status)
             self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _html(self, status: int, body: str) -> None:
+            data = body.encode("utf-8")
+            self.send_response(status)
+            self.send_header("Content-Type", "text/html; charset=utf-8")
+            self.send_header("Content-Length", str(len(data)))
+            self.end_headers()
+            self.wfile.write(data)
+
+        def _serve_file(self, path: Path) -> None:
+            try:
+                data = path.read_bytes()
+            except OSError:
+                self._text(404, "no such file")
+                return
+            ctype, _ = mimetypes.guess_type(str(path))
+            self.send_response(200)
+            self.send_header("Content-Type", ctype or "application/octet-stream")
             self.send_header("Content-Length", str(len(data)))
             self.end_headers()
             self.wfile.write(data)
@@ -194,6 +256,30 @@ def _make_handler(daemon: Daemon):
             m = _SID_POLL_RE.match(path)
             if m:
                 return self._poll(m.group(1))
+            m = _SID_ITEMS_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._list_items(dirs)
+            m = _SID_ITEM_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._get_item(resolved, dirs, unquote(m.group(2)))
+            m = _SID_ASSET_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._get_asset(resolved, unquote(m.group(2)))
+            m = _SID_ROOT_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._get_shell(resolved)
             self._text(404, "not found")
 
         def do_POST(self):
@@ -202,12 +288,68 @@ def _make_handler(daemon: Daemon):
             path = urlsplit(self.path).path
             if path == "/api/sessions":
                 return self._create_session()
+            if path == "/api/open":
+                return self._open_in_editor()
             m = _SID_FINISH_RE.match(path)
             if m:
                 return self._finish(m.group(1))
             m = _SID_CANCEL_RE.match(path)
             if m:
                 return self._cancel(m.group(1))
+            m = _SID_ASSETS_REGISTER_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._register_assets(resolved)
+            m = _SID_UPLOAD_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._upload(dirs)
+            m = _SID_SUBMIT_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._submit(resolved, dirs)
+            self._text(404, "not found")
+
+        def do_PUT(self):
+            if not self._contract_ok():
+                return
+            path = urlsplit(self.path).path
+            m = _SID_ITEM_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._put_item(resolved, dirs, unquote(m.group(2)))
+            self._text(404, "not found")
+
+        def do_PATCH(self):
+            if not self._contract_ok():
+                return
+            path = urlsplit(self.path).path
+            m = _SID_ITEMS_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._patch_items(resolved, dirs)
+            self._text(404, "not found")
+
+        def do_DELETE(self):
+            if not self._contract_ok():
+                return
+            path = urlsplit(self.path).path
+            m = _SID_ITEM_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._delete_item(resolved, dirs, unquote(m.group(2)))
             self._text(404, "not found")
 
         # ── routes ──────────────────────────────────────────────────────
@@ -238,18 +380,6 @@ def _make_handler(daemon: Daemon):
                 return
             rows = [self._row(sid) for sid, _ in daemon.registry.find(cwd=cwd, kind=kind)]
             self._json(200, rows)
-
-        def _poll(self, sid: str) -> None:
-            resolved, dirs = self._session(sid)
-            if resolved is None:
-                return
-            state_dir = Path(dirs["state_dir"])
-            flags = daemon.get_flags(resolved)
-            self._json(200, {
-                "finished": _is_marked(state_dir, _FINISHED_MARKER),
-                "cancelled": _is_marked(state_dir, _CANCELLED_MARKER),
-                "watcher_seen_at": flags.get("watcher_seen_at"),
-            })
 
         def _finish(self, sid: str) -> None:
             if not self._require_owner():
@@ -323,6 +453,210 @@ def _make_handler(daemon: Daemon):
                 "url": f"{daemon.url}/s/{sid}/",
                 "token": daemon.cfg.token,
             })
+
+        # ── items ───────────────────────────────────────────────────────
+        def _list_items(self, dirs: dict) -> None:
+            self._json(200, items.snapshot(dirs["items_dir"]))
+
+        def _get_item(self, sid: str, dirs: dict, anchor: str) -> None:
+            body = items.load_one(dirs["items_dir"], anchor)
+            if body is None:
+                self._text(404, "no such item")
+                return
+            versions = items.versions_of(dirs["items_dir"])
+            out = {"body": body, "version": versions.get(anchor, 1)}
+            # Resolved HERE, not at push time. The client edits its repository
+            # while the session is open; an anchor captured at push is wrong
+            # within a turn.
+            resolved = anchors.resolve_all(body, Path(dirs["_cwd"]))
+            if resolved:
+                out["code"] = resolved
+            self._json(200, out)
+
+        def _put_item(self, sid: str, dirs: dict, anchor: str) -> None:
+            if not self._require_owner():
+                return
+            try:
+                items.put(dirs["items_dir"], anchor, self._body())
+            except ValueError as e:
+                self._text(400, str(e))
+                return
+            daemon.registry.note_change(sid)
+            self._json(200, {"ok": True})
+
+        def _patch_items(self, sid: str, dirs: dict) -> None:
+            if not self._require_owner():
+                return
+            payload = self._body()
+            bodies = payload.get("items")
+            if not isinstance(bodies, dict):
+                self._text(400, "items must be an object of anchor -> body")
+                return
+            replace = bool(payload.get("replace", False))
+            try:
+                items.put_many(dirs["items_dir"], bodies, replace=replace)
+            except ValueError as e:
+                self._text(400, str(e))
+                return
+            daemon.registry.note_change(sid)
+            self._json(200, {"ok": True})
+
+        def _delete_item(self, sid: str, dirs: dict, anchor: str) -> None:
+            if not self._require_owner():
+                return
+            items.delete(dirs["items_dir"], anchor)
+            daemon.registry.note_change(sid)
+            self._json(200, {"ok": True})
+
+        # ── assets and the page ────────────────────────────────────────────
+        def _register_assets(self, sid: str) -> None:
+            if not self._require_owner():
+                return
+            payload = self._body()
+            static_root = payload.get("static_root")
+            if not isinstance(static_root, str) or not static_root:
+                self._text(400, "static_root is required")
+                return
+            try:
+                root = Path(static_root).resolve()
+            except (OSError, ValueError) as e:
+                self._text(400, "static_root could not be resolved (%s)"
+                           % e.__class__.__name__)
+                return
+            if not root.is_dir():
+                self._text(400, "static_root must be an existing directory")
+                return
+            entry = payload.get("entry")
+            entry = entry if isinstance(entry, str) and entry else None
+            daemon.set_asset_root(sid, str(root), entry)
+            self._json(200, {"ok": True})
+
+        def _get_asset(self, sid: str, relpath: str) -> None:
+            info = daemon.get_asset_root(sid)
+            if info is None:
+                self._text(404, "no renderer registered for this session")
+                return
+            root = Path(info["root"])
+            try:
+                # resolve() follows symlinks BEFORE the containment test --
+                # a link inside the bundle pointing out of it must not
+                # smuggle a file through.
+                target = (root / relpath).resolve()
+            except (OSError, ValueError):
+                self._text(403, "forbidden")
+                return
+            if not target.is_relative_to(root):
+                self._text(403, "forbidden")
+                return
+            if not target.is_file():
+                self._text(404, "no such asset")
+                return
+            self._serve_file(target)
+
+        def _get_shell(self, sid: str) -> None:
+            # A minimal placeholder shell. Task 13 replaces this with the
+            # packaged shell.html template; the only property this task owns
+            # is that a session always gets SOME page back, and that it names
+            # the daemon's runtime and (when registered) the renderer entry.
+            info = daemon.get_asset_root(sid)
+            entry_tag = ""
+            if info and info.get("entry"):
+                entry_tag = ('<script type="module" src="assets/%s"></script>'
+                             % info["entry"])
+            html = (
+                '<!doctype html><html><head><meta charset="utf-8"></head>'
+                '<body><script src="/_wc/core.js"></script>'
+                + entry_tag + '</body></html>'
+            )
+            self._html(200, html)
+
+        # ── uploads, submit, poll ────────────────────────────────────────
+        def _upload(self, dirs: dict) -> None:
+            if not self._require_owner():
+                return
+            uploads.handle(self, dirs)
+
+        def _submit(self, sid: str, dirs: dict) -> None:
+            if not self._require_owner():
+                return
+            payload = self._body()
+            anchor = payload.get("anchor")
+            text = payload.get("text")
+            if not isinstance(anchor, str) or not items.valid_anchor(anchor):
+                self._text(400, "anchor is required and must be a valid anchor")
+                return
+            if not isinstance(text, str) or not text.strip():
+                self._text(400, "text is required")
+                return
+            image_refs = payload.get("images") or []
+            if image_refs and not uploads.images_ok(image_refs, dirs["state_dir"]):
+                self._text(400, "images must reference this session's uploads")
+                return
+            event_id = events.append(dirs["events_dir"], {
+                "anchor": anchor, "text": text, "images": image_refs,
+            })
+            daemon.registry.note_change(sid)
+            self._json(202, {"event_id": event_id})
+
+        def _poll(self, sid: str) -> None:
+            resolved, dirs = self._session(sid)
+            if resolved is None:
+                return
+            state_dir = Path(dirs["state_dir"])
+            flags = daemon.get_flags(resolved)
+            self._json(200, {
+                "finished": _is_marked(state_dir, _FINISHED_MARKER),
+                "cancelled": _is_marked(state_dir, _CANCELLED_MARKER),
+                "watcher_seen_at": flags.get("watcher_seen_at"),
+                "items": items.versions_of(dirs["items_dir"]),
+                "threads": threads.list_versions(dirs["threads_dir"]),
+            })
+
+        # ── open in editor ──────────────────────────────────────────────
+        def _path_in_any_session_cwd(self, target: Path) -> bool:
+            """One daemon now holds sessions from every project on the
+            machine, so this is the whole defence for the daemon's only
+            subprocess capability."""
+            for _, dirs in daemon.registry.items():
+                cwd = dirs.get("_cwd")
+                if not cwd:
+                    continue
+                try:
+                    root_real = Path(cwd).resolve()
+                except (OSError, ValueError):
+                    continue
+                if target.is_relative_to(root_real):
+                    return True
+            return False
+
+        def _open_in_editor(self) -> None:
+            if not self._require_owner():
+                return
+            payload = self._body()
+            file_ = payload.get("file")
+            if not isinstance(file_, str) or not file_:
+                self._text(400, "file is required")
+                return
+            line = payload.get("line")
+            line = line if isinstance(line, int) and not isinstance(line, bool) and line > 0 else None
+            try:
+                target = Path(file_).resolve()
+            except (OSError, ValueError) as e:
+                self._text(400, "path could not be resolved (%s)" % e.__class__.__name__)
+                return
+            if not self._path_in_any_session_cwd(target):
+                self._text(403, "forbidden: outside every session's workspace")
+                return
+            if not target.is_file():
+                self._text(404, "no such file")
+                return
+            try:
+                subprocess.Popen(_editor_command(target, line), start_new_session=True,
+                                 stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except OSError as e:
+                self._text(500, "could not launch the editor (%s)" % e.__class__.__name__)
+                return
+            self._json(200, {"opened": str(target), "line": line})
 
     return Handler
 
