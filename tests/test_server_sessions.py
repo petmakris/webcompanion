@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 
 from webcompanion import CONTRACT, __version__
@@ -132,6 +133,29 @@ def test_the_daemon_boots_and_serves_even_when_the_startup_sweep_raises(tmp_path
         status, body = raw_call(d, "GET", "/health")
         assert status == 200
         assert body["contract"] == CONTRACT
+    finally:
+        d.stop()
+
+
+def test_a_swallowed_startup_sweep_failure_leaves_a_durable_marker(tmp_path, monkeypatch):
+    """A stderr traceback alone means nobody learns cleanup stopped running
+    -- `doctor` needs something durable under state_root to report."""
+    def _boom(cfg, registry):
+        raise PermissionError("simulated: cleanup sweep failed")
+
+    monkeypatch.setattr(cleanup, "sweep", _boom)
+
+    state_root = tmp_path / "state"
+    cfg = Config(port=0, token=mint_token(), bind="127.0.0.1",
+                workspace_root=tmp_path / "ws")
+    d = Daemon(cfg, state_root=state_root)
+    d.start()
+    try:
+        marker_path = state_root / "startup_sweep_failed.json"
+        assert marker_path.is_file()
+        marker = json.loads(marker_path.read_text())
+        assert "PermissionError" in marker["error"]
+        assert marker["when"] > 0
     finally:
         d.stop()
 
