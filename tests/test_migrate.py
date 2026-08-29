@@ -297,3 +297,52 @@ def test_both_source_and_destination_present_is_left_for_a_human(tmp_path):
     # Neither side was touched.
     assert (old / "annotate" / "workspaces" / "s1").is_dir()
     assert (dest / "sentinel.txt").exists()
+
+
+# ── containment: a row must live under the root it was read from ─────────
+
+def test_a_row_pointing_outside_its_own_root_is_flagged_not_moved(tmp_path):
+    """The real fix for the incident that produced `--into`.
+
+    Copying an old root's tree to a scratch location does not rewrite the
+    absolute paths inside its `sessions.json`, so `plan()` pointed at the
+    copy still resolves `old_base` to the ORIGINAL, live directory -- and
+    `apply()` moved 30 real workspaces. A legitimate legacy row always lives
+    under the root it was read from; one that does not is refused.
+    """
+    elsewhere = tmp_path / "the-real-live-one" / "sessions" / "s1"
+    (elsewhere / "state").mkdir(parents=True)
+
+    copied_root = tmp_path / "scratch" / "annotate"
+    copied_root.mkdir(parents=True)
+    (copied_root / "sessions.json").write_text(json.dumps({
+        "s1": {"state_dir": str(elsewhere / "state"), "_cwd": str(tmp_path)}}))
+
+    rows = migrate.plan([copied_root])
+    assert len(rows) == 1
+    assert rows[0]["contained"] is False
+
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")
+    summary = migrate.apply(rows, cfg, reg)
+
+    assert summary["needs_attention"] == 1
+    assert summary["moved"] == 0
+    assert elsewhere.is_dir(), "the live directory was moved anyway"
+
+
+def test_an_ordinary_row_under_its_own_root_is_contained_and_moves(tmp_path):
+    """The negative control: containment must not refuse the normal case."""
+    old_root = tmp_path / "old" / "annotate"
+    base = old_root / "sessions" / "s1"
+    (base / "state").mkdir(parents=True)
+    (old_root / "sessions.json").write_text(json.dumps({
+        "s1": {"state_dir": str(base / "state"), "_cwd": str(tmp_path)}}))
+
+    rows = migrate.plan([old_root])
+    assert rows[0]["contained"] is True
+
+    cfg = Config(workspace_root=tmp_path / "ws")
+    summary = migrate.apply(rows, cfg, Registry(tmp_path / "state"))
+    assert summary["moved"] == 1
+    assert summary["needs_attention"] == 0

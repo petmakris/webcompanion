@@ -21,6 +21,17 @@ safe way to rehearse this module against real data is `apply(..., into=DIR)`
 moving it and leaves every source untouched -- never copy the directory
 tree yourself and call `apply()` on it expecting isolation.
 
+`--apply` REFUSES WHILE THE DAEMON IS RUNNING. The README's own install
+order starts the service first, and the daemon and this command are two
+processes writing one `sessions.json`. `Registry.persist` now locks and
+merges, so a concurrent write no longer silently drops rows -- but a
+migration is a whole-tree move of irreplaceable data, and the daemon's
+startup sweep deletes any sid-shaped directory no row points at. Doing that
+alongside a live sweeper is not a shape worth supporting: stop the service,
+migrate, start it again. `--into` (rehearsal) still runs, because it copies
+into a throwaway root and registers into a throwaway registry, so it never
+touches the daemon's.
+
 `plan()` reads each old root's `sessions.json` / `sessions_meta.json` and
 returns rows describing what would move. It never writes, creates, or moves
 anything -- a dry run is just printing this. `apply()` is the only function
@@ -120,6 +131,15 @@ def _default_old_roots() -> list[Path]:
     return [Path.home() / ".claude" / name for name in _OLD_SKILLS]
 
 
+def _under(candidate: Path, root: Path) -> bool:
+    """Does `candidate` resolve to somewhere inside `root`? Resolve both --
+    a symlinked root would otherwise fail a purely textual comparison."""
+    try:
+        return Path(candidate).resolve().is_relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return False
+
+
 def _read_json(path: Path, default):
     try:
         return json.loads(Path(path).read_text())
@@ -163,6 +183,14 @@ def plan(old_roots: list[Path]) -> list[dict]:
             if not base_ref:
                 continue  # nothing recognizable to locate this session's tree
             old_base = Path(base_ref).parent
+            # A legitimate legacy row always lives under the root it was
+            # read from -- the old servers wrote absolute paths into their
+            # OWN root's sessions.json. A row pointing anywhere else is
+            # either corrupt or (the Task 17 incident) a registry file
+            # copied to a scratch location while its paths still name the
+            # original, live directories. `apply()` refuses such a row
+            # rather than moving whatever it happens to point at.
+            contained = _under(old_base, old_root)
             meta_row = meta.get(sid) if isinstance(meta.get(sid), dict) else {}
             slug = meta_row.get("slug") or sid
             content_path = Path(response_dir) / "blocks.json" if response_dir else None
@@ -173,6 +201,8 @@ def plan(old_roots: list[Path]) -> list[dict]:
                 "title": meta_row.get("title", slug),
                 "cwd": dirs.get("_cwd", ""),
                 "old_base": old_base,
+                "old_root": old_root,
+                "contained": contained,
                 "new_base": Path(kind) / sid,
                 "content_path": content_path,
             })
@@ -314,6 +344,15 @@ def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry,
             summary["already_done"] += 1
             continue
 
+        if row.get("contained") is False:
+            # See `plan()`: this row names a directory outside the root it
+            # was read from, so nothing here can say it is really this
+            # migration's to move.
+            summary["needs_attention"] += 1
+            _flag(kind, sid, f"{row['old_base']} is outside "
+                             f"{row.get('old_root')}; refusing to move it")
+            continue
+
         old_base = Path(row["old_base"])
         try:
             new_base = paths.kind_root(dest_cfg, kind) / sid
@@ -394,6 +433,26 @@ def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry,
     return summary
 
 
+def _daemon_is_answering() -> bool:
+    """True if something answers /health at the configured address.
+
+    Deliberately the same health check every other command makes, not a
+    pidfile or a `launchctl list`: what matters is whether a process is
+    live and writing to the registry right now, and only an answered
+    request proves that.
+    """
+    from webcompanion.client import ContractMismatch
+    from webcompanion.commands._common import client_from_config
+
+    try:
+        client_from_config().health()
+    except ContractMismatch:
+        return True  # answering, just not in a version we agree with
+    except Exception:
+        return False
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="webcompanion migrate")
     mode = p.add_mutually_exclusive_group()
@@ -458,6 +517,20 @@ def run(argv: list[str]) -> int:
         print(f"\n{len(rows)} session(s) found. Re-run with --apply to migrate them, "
               f"or --into DIR to rehearse first.")
         return 0
+
+    if _daemon_is_answering():
+        print("webcompanion migrate: the companion service is running.\n"
+              "\n"
+              "  A migration moves whole workspaces while the daemon's own\n"
+              "  startup sweep deletes any it does not have a registry row\n"
+              "  for. Stop the service first, then migrate, then start it:\n"
+              "\n"
+              "    launchctl bootout gui/$UID/dev.webcompanion    # macOS\n"
+              "    systemctl --user stop webcompanion             # Linux\n"
+              "\n"
+              "  webcompanion migrate --into DIR rehearses safely and does\n"
+              "  not require stopping anything.", file=sys.stderr)
+        return 1
 
     cfg = cfgmod.load()
     registry = Registry(paths.state_root())
