@@ -346,3 +346,39 @@ def test_an_ordinary_row_under_its_own_root_is_contained_and_moves(tmp_path):
     summary = migrate.apply(rows, cfg, Registry(tmp_path / "state"))
     assert summary["moved"] == 1
     assert summary["needs_attention"] == 0
+
+
+def test_both_spellings_of_interactive_review_are_migrated(tmp_path):
+    """The skill writes `~/.claude/interactive-review` with a HYPHEN.
+    _OLD_SKILLS named only `interactive_review`, and plan() reads
+    `<root>/sessions.json`, which does not exist under a name nothing uses
+    -- so migrate found nothing there and reported success while leaving
+    every one of those sessions behind. Eight of thirty, on the machine this
+    was found on.
+    """
+    assert "interactive-review" in migrate._OLD_SKILLS
+    assert "interactive_review" in migrate._OLD_SKILLS
+
+    roots = migrate._default_old_roots()
+    names = {r.name for r in roots}
+    assert "interactive-review" in names
+
+
+def test_a_hyphenated_root_migrates_under_its_own_kind(tmp_path):
+    old_root = tmp_path / "interactive-review"
+    base = old_root / "sessions" / "s1"
+    (base / "state").mkdir(parents=True)
+    (old_root / "sessions.json").write_text(json.dumps({
+        "s1": {"state_dir": str(base / "state"), "_cwd": str(tmp_path)}}))
+
+    rows = migrate.plan([old_root])
+    assert [r["kind"] for r in rows] == ["interactive-review"]
+
+    cfg = Config(workspace_root=tmp_path / "ws")
+    assert migrate.apply(rows, cfg, Registry(tmp_path / "state"))["moved"] == 1
+    assert (tmp_path / "ws" / "interactive-review" / "s1").is_dir()
+
+
+def test_a_root_that_does_not_exist_is_skipped_not_an_error(tmp_path):
+    """Listing both spellings only works because a missing root is free."""
+    assert migrate.plan([tmp_path / "never-created"]) == []

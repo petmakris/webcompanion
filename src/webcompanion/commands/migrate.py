@@ -107,10 +107,21 @@ from webcompanion import config as cfgmod
 from webcompanion import items, paths
 from webcompanion.registry import Registry
 
-# The five per-skill state roots this package replaces. Each root's own
-# directory name already matches its `kind` name in the new registry
+# The per-skill state roots this package replaces. Each root's own directory
+# name already matches its `kind` name in the new registry
 # (`~/.claude/annotate`, `~/.claude/deck`, ...), so no renaming is needed.
-_OLD_SKILLS = ("annotate", "deck", "dataflow", "walkthrough", "interactive_review")
+#
+# BOTH spellings of interactive-review are listed, and that is not
+# belt-and-braces. The directory the skill actually writes is
+# `~/.claude/interactive-review` with a HYPHEN; this tuple named only the
+# underscored form, and `plan()` reads `<root>/sessions.json` -- which does
+# not exist under the underscored name -- so a migration silently found
+# nothing there and reported success while leaving every one of those
+# sessions behind. On the machine this was found on that was 8 sessions out
+# of 30. A root that does not exist costs one failed read and is skipped, so
+# listing both is free.
+_OLD_SKILLS = ("annotate", "deck", "dataflow", "walkthrough",
+               "interactive-review", "interactive_review")
 
 # Only this kind ever wrote response/blocks.json in the old layout. Every
 # session's `dirs` carries a `response_dir` key regardless of kind (it is

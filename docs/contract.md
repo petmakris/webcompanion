@@ -39,11 +39,13 @@ every client kind that talks to it.
   ```
 
   Note the hyphen in `interactive-review`. `webcompanion migrate` derives a
-  kind from the old per-skill directory name, so a session migrated from
-  `~/.claude/interactive_review` arrives as `interactive_review` with an
-  underscore. Those are two different kinds to the daemon. A client whose
-  sessions predate the migration should query both and treat the hyphenated
-  form as canonical for anything it creates.
+  kind from the old per-skill directory name, and the directory that skill
+  writes is `~/.claude/interactive-review`, so a migrated session arrives
+  under the hyphenated kind — the same one a client should push. A session
+  migrated from a directory named `interactive_review` would arrive under
+  that kind instead, and the two are different partitions to the daemon; a
+  client that finds nothing under one spelling should try the other before
+  concluding a session is gone.
 - **Item** — one opaque JSON body addressed by a client-chosen string
   called an **anchor**. The daemon never inspects an item's shape; it
   stores the body, derives a version from its content hash, and hands both
