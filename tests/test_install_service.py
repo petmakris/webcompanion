@@ -214,3 +214,100 @@ def test_run_returns_nonzero_and_says_so_when_the_service_would_not_start(
     err = capsys.readouterr().err
     assert "could not start" in err
     assert "exited 5" in err
+
+
+# ── uninstall ────────────────────────────────────────────────────────────
+#
+# Every test below passes target_dir, so the real launchd/systemd session is
+# never touched and no real service is unloaded.
+
+from webcompanion.commands import uninstall as unins
+
+
+def test_uninstall_removes_the_service_file_and_the_zipapp(tmp_path, monkeypatch, capsys):
+    """`pipx uninstall webcompanion` leaves both behind: an always-on daemon
+    holding port 3080 with no command left on the machine to stop it."""
+    target = tmp_path / "agents"
+    target.mkdir()
+    name = ("dev.webcompanion.plist" if sys.platform == "darwin"
+            else svc.DEFAULT_SERVICE_NAME)
+    unit = target / name
+    unit.write_text("<service definition>")
+    pyz = tmp_path / "webcompanion.pyz"
+    pyz.write_text("zipapp")
+    monkeypatch.setattr(unins, "default_zipapp_path", lambda: pyz)
+    monkeypatch.setattr(cfgmod, "config_path", lambda: tmp_path / "config.json")
+
+    assert unins.run([], target_dir=target) == 0
+    assert not unit.exists()
+    assert not pyz.exists()
+    out = capsys.readouterr().out
+    assert str(unit) in out and str(pyz) in out
+
+
+def test_uninstall_leaves_the_config_and_the_workspaces_alone(tmp_path, monkeypatch, capsys):
+    """The config carries the write token an IDE plugin has saved, and the
+    workspaces are the user's data with no backup. Removing either is not a
+    decision an uninstall command gets to make."""
+    config = tmp_path / "config.json"
+    cfgmod.write(cfgmod.Config(token="keep-me",
+                               workspace_root=tmp_path / "ws"), config)
+    monkeypatch.setattr(cfgmod, "config_path", lambda: config)
+    monkeypatch.setattr(unins, "default_zipapp_path",
+                        lambda: tmp_path / "absent.pyz")
+    workspace = tmp_path / "ws" / "annotate" / "250101-120000-aaaabbbbccccdddd"
+    workspace.mkdir(parents=True)
+
+    target = tmp_path / "agents"
+    target.mkdir()
+    assert unins.run([], target_dir=target) == 0
+
+    assert config.is_file()
+    assert json.loads(config.read_text())["token"] == "keep-me"
+    assert workspace.is_dir()
+    out = capsys.readouterr().out
+    assert str(config) in out
+    assert str(tmp_path / "ws") in out
+
+
+def test_uninstalling_twice_is_not_an_error(tmp_path, monkeypatch, capsys):
+    monkeypatch.setattr(cfgmod, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setattr(unins, "default_zipapp_path",
+                        lambda: tmp_path / "absent.pyz")
+    target = tmp_path / "agents"
+    target.mkdir()
+
+    assert unins.run([], target_dir=target) == 0
+    assert "nothing to remove" in capsys.readouterr().out
+
+
+def test_uninstall_is_a_registered_subcommand():
+    from webcompanion import cli
+    assert "uninstall" in cli.SUBCOMMANDS
+
+
+def test_uninstall_never_shells_out_for_a_throwaway_target(tmp_path, monkeypatch):
+    """The HARD LIMIT, asserted rather than assumed: with target_dir set,
+    not one launchctl or systemctl call is made."""
+    calls = []
+    monkeypatch.setattr(unins.subprocess, "run",
+                        lambda cmd, **kw: calls.append(list(cmd)))
+    monkeypatch.setattr(cfgmod, "config_path", lambda: tmp_path / "config.json")
+    monkeypatch.setattr(unins, "default_zipapp_path",
+                        lambda: tmp_path / "absent.pyz")
+    target = tmp_path / "agents"
+    target.mkdir()
+
+    unins.run([], target_dir=target)
+    assert calls == []
+
+
+def test_the_stop_step_names_the_unit_file_on_linux(tmp_path, monkeypatch):
+    """Same trap install-service fell into: systemd addresses the unit by
+    filename, not by the launchd label."""
+    calls = []
+    monkeypatch.setattr(unins.subprocess, "run",
+                        lambda cmd, **kw: calls.append(list(cmd)))
+    unins._stop("linux", tmp_path / svc.DEFAULT_SERVICE_NAME, svc.DEFAULT_LABEL)
+    assert any(svc.DEFAULT_SERVICE_NAME in c for c in calls)
+    assert not any(svc.DEFAULT_LABEL in c for c in calls)
