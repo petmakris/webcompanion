@@ -87,6 +87,51 @@ def test_a_foreign_origin_against_an_ipv6_host_is_still_refused():
     assert gate.is_owner(h, token="secret") is False
 
 
+def test_a_malformed_origin_with_a_valid_host_is_refused_not_crashed():
+    # urlsplit raises ValueError: Invalid IPv6 URL on unbalanced brackets.
+    # Both headers are attacker-controlled on a raw request; a raise here
+    # would surface as a 500 instead of a 403.
+    h = FakeHandler("127.0.0.1")
+    h.headers["Origin"] = "http://["
+    h.headers["Host"] = "127.0.0.1:3080"
+    assert gate.is_owner(h, token="secret") is False
+
+
+def test_a_valid_origin_with_a_malformed_host_is_refused_not_crashed():
+    h = FakeHandler("127.0.0.1")
+    h.headers["Origin"] = "http://127.0.0.1:3080"
+    h.headers["Host"] = "["
+    assert gate.is_owner(h, token="secret") is False
+
+
+def test_a_malformed_origin_and_a_malformed_host_are_refused_not_crashed():
+    h = FakeHandler("127.0.0.1")
+    h.headers["Origin"] = "http://["
+    h.headers["Host"] = "["
+    assert gate.is_owner(h, token="secret") is False
+
+
+def test_an_origin_of_a_bare_bracket_alone_is_refused_not_crashed():
+    h = FakeHandler("127.0.0.1")
+    h.headers["Origin"] = "["
+    h.headers["Host"] = "127.0.0.1:3080"
+    assert gate.is_owner(h, token="secret") is False
+
+
+def test_sec_fetch_site_none_is_allowed():
+    # "none" means the request has no initiator at all (typed URL, bookmark,
+    # curl with the header set) — not attacker-controlled navigation.
+    h = FakeHandler("127.0.0.1")
+    h.headers["Sec-Fetch-Site"] = "none"
+    assert gate.is_owner(h, token="secret") is True
+
+
+def test_sec_fetch_site_same_site_is_allowed():
+    h = FakeHandler("127.0.0.1")
+    h.headers["Sec-Fetch-Site"] = "same-site"
+    assert gate.is_owner(h, token="secret") is True
+
+
 def test_a_missing_contract_header_is_tolerated():
     ok, _ = gate.check_contract(FakeHandler())
     assert ok is True

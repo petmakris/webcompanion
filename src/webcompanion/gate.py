@@ -28,7 +28,43 @@ def _header(handler, name: str) -> str:
         return ""
 
 
-def _host_hostname(host: str) -> str | None:
+class _Unparseable:
+    """Sentinel returned for a header `urlsplit` refuses to parse.
+
+    Never equal to anything — including itself as a fresh instance, and
+    including `None` — so a parse failure on either side of the Origin/Host
+    comparison in `is_owner` can never accidentally compare equal and must
+    always fall through to a refusal.
+    """
+
+    def __eq__(self, other: object) -> bool:
+        return False
+
+    def __hash__(self) -> int:
+        return id(self)
+
+
+_UNPARSEABLE = _Unparseable()
+
+
+def _hostname(url: str) -> str | object | None:
+    """`urlsplit(url).hostname`, but a malformed URL fails closed.
+
+    `urlsplit` raises `ValueError: Invalid IPv6 URL` on unbalanced brackets
+    (e.g. `Origin: http://[` or `Host: [`). Both headers are fully
+    attacker-controlled on a raw request, so an unhandled raise here would
+    surface as a 500 from the one function that decides whether a request
+    may write — the worst shape a bug in this module can take. A header we
+    cannot parse is a header we do not trust, so this returns a sentinel
+    that never compares equal to anything, never `None`, never itself.
+    """
+    try:
+        return urlsplit(url).hostname
+    except ValueError:
+        return _UNPARSEABLE
+
+
+def _host_hostname(host: str) -> str | object | None:
     """Extract the hostname from a Host header, IPv6-literal-safe.
 
     `urlsplit` only parses `[::1]:3080` correctly when it looks like a URL,
@@ -37,7 +73,7 @@ def _host_hostname(host: str) -> str | None:
     which never equals `urlsplit(origin).hostname`'s `::1` — that mismatch
     would refuse the owner on IPv6 loopback.
     """
-    return urlsplit(f"//{host}").hostname if host else None
+    return _hostname(f"//{host}") if host else None
 
 
 def is_owner(handler, token: str) -> bool:
@@ -67,7 +103,7 @@ def is_owner(handler, token: str) -> bool:
     if origin:
         # HOST ONLY, deliberately: the owner may reach the daemon over either
         # scheme and through a port-forward, and neither changes who they are.
-        if urlsplit(origin).hostname != _host_hostname(_header(handler, "Host")):
+        if _hostname(origin) != _host_hostname(_header(handler, "Host")):
             return False
 
     if is_loopback(handler.client_address[0]):
