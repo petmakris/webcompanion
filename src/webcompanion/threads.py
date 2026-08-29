@@ -23,7 +23,7 @@ import json
 from pathlib import Path
 
 from webcompanion.atomic import write_text_atomic
-from webcompanion.items import encode_anchor
+from webcompanion.items import encode_anchor, valid_anchor as _items_valid_anchor
 
 GENERAL_ANCHOR = "__general__"
 
@@ -36,8 +36,7 @@ def valid_anchor(anchor: str) -> bool:
     The daemon's only requirement is that the anchor cannot walk out of the
     threads directory once encoded.
     """
-    from webcompanion.items import valid_anchor as _valid
-    return anchor == GENERAL_ANCHOR or _valid(anchor)
+    return anchor == GENERAL_ANCHOR or _items_valid_anchor(anchor)
 
 
 def _path_for(threads_dir: Path, anchor: str) -> Path:

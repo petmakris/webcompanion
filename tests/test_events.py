@@ -22,6 +22,27 @@ def test_append_monotonic_ordering(tmp_path):
     assert ids == sorted(ids), ids
 
 
+def test_append_id_sorts_lexically_across_a_digit_length_boundary(tmp_path, monkeypatch):
+    # A single test run's wall-clock nanosecond values never cross a digit-length
+    # boundary, so `ids == sorted(ids)` over calls made moments apart cannot tell
+    # a zero-padded id from an unpadded one -- both already sort the same way.
+    # Forcing timestamps that cross 999 -> 1000 -> 10000 is what actually
+    # exercises the :020d padding: unpadded, "1000" < "10000" < "999" lexically,
+    # which is NOT numeric order.
+    events_dir = tmp_path / "events"
+    events_dir.mkdir()
+    timestamps = [999, 1000, 10000]
+    it = iter(timestamps)
+    monkeypatch.setattr("webcompanion.events.time.time_ns", lambda: next(it))
+
+    ids = [append(events_dir, {"t": t}) for t in timestamps]
+
+    assert ids == sorted(ids), ids
+    # And directly: the timestamp segment is zero-padded to exactly 20 digits.
+    for eid in ids:
+        assert len(eid.split("-")[0]) == 20, eid
+
+
 def test_append_atomic_write(tmp_path):
     events_dir = tmp_path / "events"
     events_dir.mkdir()
