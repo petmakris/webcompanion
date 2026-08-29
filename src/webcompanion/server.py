@@ -22,7 +22,9 @@ import subprocess
 import sys
 import threading
 import time
+from html import escape as _html_escape
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from importlib.resources import as_file, files
 from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
@@ -84,6 +86,14 @@ def _is_terminal(state_dir: Path) -> bool:
 # it either: a cache and the disk state can disagree after a restart, and
 # the cache would silently win.
 _ASSETS_MARKER = "assets.json"
+
+
+def _static_file(name: str):
+    """Context manager yielding a real filesystem Path for a packaged static
+    asset (core.js, shell.html). importlib.resources.as_file works whether
+    the package is an installed wheel or the zipapp the service ships as in
+    Task 16 -- Path(__file__).parent does not survive the latter."""
+    return as_file(files("webcompanion").joinpath("static", name))
 
 
 def _write_asset_root(base: Path, static_root: str, entry: str | None) -> None:
@@ -282,6 +292,8 @@ def _make_handler(daemon: Daemon):
                 return self._whoami()
             if path == "/api/sessions":
                 return self._list_sessions(parse_qs(parsed.query))
+            if path == "/_wc/core.js":
+                return self._core_js()
             m = _SID_POLL_RE.match(path)
             if m:
                 return self._poll(m.group(1))
@@ -311,7 +323,7 @@ def _make_handler(daemon: Daemon):
                 resolved, dirs = self._session(m.group(1))
                 if resolved is None:
                     return
-                return self._get_shell(dirs)
+                return self._get_shell(resolved, dirs)
             self._text(404, "not found")
 
         def do_POST(self):
@@ -597,21 +609,26 @@ def _make_handler(daemon: Daemon):
                 return
             self._serve_file(target)
 
-        def _get_shell(self, dirs: dict) -> None:
-            # A minimal placeholder shell. Task 13 replaces this with the
-            # packaged shell.html template; the only property this task owns
-            # is that a session always gets SOME page back, and that it names
-            # the daemon's runtime and (when registered) the renderer entry.
+        def _core_js(self) -> None:
+            with _static_file("core.js") as p:
+                self._serve_file(p)
+
+        def _get_shell(self, sid: str, dirs: dict) -> None:
+            # The packaged shell.html template, with its two placeholders
+            # filled in: {{TITLE}} from the session's own metadata, {{ENTRY}}
+            # with the registered renderer's script tag (or nothing, when no
+            # renderer has registered yet) -- a session always gets SOME
+            # page back, and it always names the daemon's runtime.
             info = _read_asset_root(paths.base_of(dirs))
             entry_tag = ""
             if info and info.get("entry"):
                 entry_tag = ('<script type="module" src="assets/%s"></script>'
                              % info["entry"])
-            html = (
-                '<!doctype html><html><head><meta charset="utf-8"></head>'
-                '<body><script src="/_wc/core.js"></script>'
-                + entry_tag + '</body></html>'
-            )
+            title = daemon.registry.get_meta(sid).get("title") or "webcompanion"
+            with _static_file("shell.html") as p:
+                template = p.read_text()
+            html = (template.replace("{{TITLE}}", _html_escape(title))
+                             .replace("{{ENTRY}}", entry_tag))
             self._html(200, html)
 
         # ── uploads, submit, poll ────────────────────────────────────────
