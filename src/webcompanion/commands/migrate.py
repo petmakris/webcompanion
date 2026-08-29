@@ -59,17 +59,37 @@ row was found under, which also happens to already be the new kind name.
 Old slugs were deduped globally; the new registry dedupes per kind, so two
 old roots that both used slug `my-plan` land side by side, unrenamed.
 
-Idempotent: the old `sessions.json` is never rewritten by this module, so a
-second run sees the same rows `plan()` saw the first time. `apply()` treats a
-sid already known to the registry, or whose `old_base` no longer exists on
-disk, as already done and moves nothing for it. Verified against a copy of
-30 real sessions across all five roots: a second `--apply` moved 0.
+Idempotent, and safe to resume after a crash: the old `sessions.json` is
+never rewritten by this module, so a second run sees the same rows `plan()`
+saw the first time. Per row, `apply()` decides what to do by comparing
+whether the SOURCE (`old_base`) and the DESTINATION (`kind_root/sid`) exist,
+never by trusting one side alone:
+
+- source present, destination absent -> the ordinary case: transfer it.
+- destination present and `registry` already has this sid -> genuinely
+  done; skip. This is the repeat-run case verified against a copy of 30
+  real sessions across all five roots: a second `--apply` moved 0.
+- destination present, `registry` does NOT have this sid -> a transfer that
+  completed but was never registered: a kill, a full disk, or a power loss
+  between `shutil.move` and `registry.create`. The data is already
+  sitting at the destination and reachable from nowhere. ADOPT it: finish
+  registering it (and finish converting its content / relocating its
+  threads, if that had not completed either) against the data already
+  there, rather than reporting it done-and-unreachable forever. Counted as
+  `recovered`. This was found as a Critical during Task 17 review, by
+  killing the process between the move and the registration and observing
+  that a retry classified the resulting orphan as finished.
+- source AND destination both present, neither registered -> ambiguous;
+  never guess which copy is authoritative. Counted as `needs_attention` and
+  reported by kind and sid; left untouched for a human to resolve.
+- neither present -> nothing left to do; already done.
 """
 from __future__ import annotations
 
 import argparse
 import json
 import shutil
+import sys
 from pathlib import Path
 
 from webcompanion import config as cfgmod
@@ -184,31 +204,82 @@ def _load_blocks(content_path: Path | None) -> dict[str, dict] | None:
     return bodies
 
 
-def _relocate_threads(new_base: Path, threads_dir: Path) -> int:
+def _relocate_threads(new_base: Path, threads_dir: Path) -> tuple[int, int]:
     """Move every thread file from the old `<base>/state/threads/` (already
     sitting at `new_base` after the whole-tree move) into the new
     `threads_dir`. Filenames are kept as-is -- they are already
-    `encode_anchor` output, so this is a move, not a re-encode. Returns the
-    count moved, so a caller can verify nothing was left behind.
+    `encode_anchor` output, so this is a move, not a re-encode.
+
+    Safe to call twice against the same session: a file already present at
+    its destination (because an earlier, interrupted call already moved it)
+    is counted as done and left alone rather than reprocessed or clobbered.
+    That is what lets the crash-recovery ("adopt") path in `apply()` just
+    call this again to finish a relocation that died partway through.
+
+    Returns `(moved, found)`. `found` is every candidate file seen in the
+    old location; `moved` is how many of those are now safely at the
+    destination (whether moved just now or already there from a prior
+    partial run). `moved < found` means at least one file hit an OSError and
+    is stuck in the old location -- the caller should flag the session by
+    kind and sid rather than silently reporting the relocation as clean.
     """
     old_threads = Path(new_base).joinpath(*_OLD_THREADS_REL)
     if not old_threads.is_dir():
-        return 0
+        return 0, 0
     threads_dir = Path(threads_dir)
     threads_dir.mkdir(parents=True, exist_ok=True)
+    found = 0
     moved = 0
     for f in sorted(old_threads.iterdir()):
         if not f.is_file():
             continue
+        found += 1
         dest = threads_dir / f.name
         if dest.exists():
-            continue  # never guess which of two files claiming one name is right
+            moved += 1  # already relocated by an earlier, interrupted call
+            continue
         try:
             shutil.move(str(f), str(dest))
             moved += 1
         except (OSError, shutil.Error):
-            continue
-    return moved
+            continue  # left in place on purpose; caller sees moved < found
+    return moved, found
+
+
+def _flag(kind: str, sid: str, reason: str) -> None:
+    """Attribute a failure or ambiguity to the exact session it happened to.
+    An aggregate count like "errors: 2" tells a user nothing about which two
+    sessions need a look; this is what makes that actionable."""
+    print(f"webcompanion migrate: {kind}/{sid}: {reason}", file=sys.stderr)
+
+
+def _content_outcome(kind: str, old_base: Path, new_base: Path, row: dict,
+                     dirs: dict) -> str:
+    """`migrated` / `needs_repush` / `read_only` for one session already
+    sitting at `new_base`. See the module docstring for what each means."""
+    if kind != _ITEM_FORMAT_KIND:
+        # Not the kind that ever spoke blocks.json -- its content is intact
+        # on disk under its own old format, just not converted. Its own
+        # skill re-pushes it once it speaks the new contract.
+        return "needs_repush"
+
+    moved_content_path = None
+    content_path = row.get("content_path")
+    if content_path is not None:
+        try:
+            moved_content_path = new_base / Path(content_path).relative_to(old_base)
+        except ValueError:
+            moved_content_path = Path(content_path)
+
+    bodies = _load_blocks(moved_content_path)
+    if bodies is None:
+        return "read_only"
+    if bodies:
+        try:
+            items.put_many(dirs["items_dir"], bodies)
+        except ValueError:
+            return "read_only"
+    return "migrated"
 
 
 def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry,
@@ -216,7 +287,8 @@ def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry,
     """Perform the move `plan()` described: relocate each workspace under its
     kind, relocate its comment threads, convert an `annotate` session's
     `blocks.json` into items, and register it. See the module docstring for
-    the three content outcomes (`migrated`, `needs_repush`, `read_only`).
+    the three content outcomes (`migrated`, `needs_repush`, `read_only`) and
+    for the crash-recovery decision table this function implements.
 
     `into`, if given, turns this into a rehearsal: every workspace is
     COPIED into `<into>/<kind>/<sid>` instead of moved, `cfg` is ignored for
@@ -226,95 +298,98 @@ def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry,
     returned summary shape -- copy versus move is the only difference. Pass
     a throwaway `registry` for a rehearsal; this function still calls
     `registry.persist()` on it.
-
-    Idempotent two ways: a sid `registry` already knows about (same process,
-    same run, or rehydrated from a prior run) is skipped, and a sid whose
-    `old_base` no longer exists on disk (an earlier `--apply` already moved
-    it) is skipped too -- the old `sessions.json` is never rewritten by this
-    module, so that disk check is what makes re-running the CLI safe across
-    process restarts. (A rehearsal never removes `old_base`, so re-running a
-    rehearsal into the same `into` directory hits the destination-collision
-    check below instead -- rehearsals are meant to be disposable, not
-    idempotent across repeated runs into one target.)
     """
     dest_cfg = cfgmod.Config(workspace_root=Path(into)) if into is not None else cfg
     summary = {
-        "moved": 0, "migrated": 0, "needs_repush": 0, "read_only": 0,
-        "already_done": 0, "errors": 0,
+        "moved": 0, "recovered": 0, "migrated": 0, "needs_repush": 0,
+        "read_only": 0, "needs_attention": 0, "already_done": 0, "errors": 0,
     }
     for row in plan_rows:
         sid, kind = row["sid"], row["kind"]
 
         if registry.lookup(sid) is not None:
+            # A row already resolves to this sid -- genuinely done, whether
+            # from this process's own earlier work or a prior run this
+            # registry was rehydrated from.
             summary["already_done"] += 1
             continue
 
         old_base = Path(row["old_base"])
-        if not old_base.is_dir():
-            summary["already_done"] += 1
-            continue
-
         try:
             new_base = paths.kind_root(dest_cfg, kind) / sid
         except ValueError:
             summary["errors"] += 1
-            continue
-        if new_base.exists():
-            # Something already claims this destination -- refuse to
-            # clobber it rather than guess which copy is the real one.
-            summary["errors"] += 1
+            _flag(kind, sid, "not a valid kind name")
             continue
 
-        try:
-            new_base.parent.mkdir(parents=True, exist_ok=True)
-            if into is not None:
-                shutil.copytree(str(old_base), str(new_base))
-            else:
-                shutil.move(str(old_base), str(new_base))
-        except (OSError, shutil.Error):
-            summary["errors"] += 1
+        source_present = old_base.is_dir()
+        dest_present = new_base.exists()
+
+        if not source_present and not dest_present:
+            # Stale row: nothing on either side. Nothing to recover.
+            summary["already_done"] += 1
             continue
 
-        dirs = paths.make_session_dirs(dest_cfg, kind, sid)
-        _relocate_threads(new_base, dirs["threads_dir"])
+        if source_present and dest_present:
+            # Something occupies both the source and the destination and
+            # neither is registered. Two copies with no way to tell which
+            # is authoritative -- never guess; a human has to look.
+            summary["needs_attention"] += 1
+            _flag(kind, sid, f"both {old_base} and {new_base} exist, unregistered")
+            continue
 
-        if kind == _ITEM_FORMAT_KIND:
-            moved_content_path = None
-            content_path = row.get("content_path")
-            if content_path is not None:
-                try:
-                    moved_content_path = new_base / Path(content_path).relative_to(old_base)
-                except ValueError:
-                    moved_content_path = Path(content_path)
-
-            bodies = _load_blocks(moved_content_path)
-            if bodies is None:
-                outcome = "read_only"
-            else:
-                outcome = "migrated"
-                if bodies:
-                    try:
-                        items.put_many(dirs["items_dir"], bodies)
-                    except ValueError:
-                        outcome = "read_only"
+        recovered = not source_present  # dest_present and not source_present
+        if recovered:
+            # The transfer already completed -- a prior run died between the
+            # move and registering it. Adopt what is already there instead
+            # of reporting it done-and-unreachable forever.
+            pass
         else:
-            # Not the kind that ever spoke blocks.json -- its content is
-            # intact on disk under its own old format, just not converted.
-            # Its own skill re-pushes it once it speaks the new contract.
-            outcome = "needs_repush"
+            try:
+                new_base.parent.mkdir(parents=True, exist_ok=True)
+                if into is not None:
+                    shutil.copytree(str(old_base), str(new_base))
+                else:
+                    shutil.move(str(old_base), str(new_base))
+            except (OSError, shutil.Error) as e:
+                summary["errors"] += 1
+                _flag(kind, sid, f"transfer failed: {e}")
+                continue
+            summary["moved"] += 1
+
+        # Idempotent either way: make_session_dirs is exist_ok, and
+        # _relocate_threads treats a file already at its destination as
+        # done rather than reprocessing it -- so re-running these two against
+        # a session that was already fully finished, or only partly, both
+        # converge on the same complete result.
+        dirs = paths.make_session_dirs(dest_cfg, kind, sid)
+        threads_moved, threads_found = _relocate_threads(new_base, dirs["threads_dir"])
+        if threads_moved < threads_found:
+            summary["errors"] += 1
+            _flag(kind, sid,
+                  f"{threads_found - threads_moved} of {threads_found} thread "
+                  f"file(s) could not be relocated")
+            # Still register below: most of the session's data (items, and
+            # whatever threads DID move) is reachable, and refusing to
+            # register it would make even that unreachable too.
+
+        outcome = _content_outcome(kind, old_base, new_base, row, dirs)
 
         meta_base = {"title": row.get("title", row["slug"])}
         if outcome == "read_only":
             meta_base["read_only"] = True
         elif outcome == "needs_repush":
             meta_base["needs_repush"] = True
+        if recovered:
+            meta_base["recovered"] = True
 
         registry.create(kind, sid, dirs, meta_base, row.get("cwd", ""),
                          explicit_slug=row["slug"])
         paths.write_marker(paths.base_of(dirs), sid, kind, row.get("cwd", ""))
         registry.persist()
 
-        summary["moved"] += 1
+        if recovered:
+            summary["recovered"] += 1
         summary[outcome] += 1
     return summary
 
@@ -334,9 +409,11 @@ def build_parser() -> argparse.ArgumentParser:
 
 def _print_summary(prefix: str, summary: dict) -> None:
     print(f"{prefix}moved: {summary['moved']}  "
+          f"recovered: {summary['recovered']}  "
           f"migrated: {summary['migrated']}  "
           f"needs_repush: {summary['needs_repush']}  "
           f"read_only: {summary['read_only']}  "
+          f"needs_attention: {summary['needs_attention']}  "
           f"already_done: {summary['already_done']}  "
           f"errors: {summary['errors']}")
 
@@ -357,6 +434,12 @@ def run(argv: list[str]) -> int:
         print(f"rehearsal: sources left in place -- copying into {into_dir}")
         dest_cfg = cfgmod.Config(workspace_root=into_dir)
         registry = Registry(into_dir / ".registry")
+        # Rehydrate so a second rehearsal into the same directory reports
+        # already_done for what a prior rehearsal already copied there,
+        # instead of tripping the both-present/needs_attention check --
+        # copying never removes the source, so without this every rerun
+        # would look identical to the ambiguous case.
+        registry.rehydrate()
         summary = apply(rows, dest_cfg, registry, into=into_dir)
         _print_summary("rehearsal: sources left in place  --  ", summary)
         return 1 if summary["errors"] else 0

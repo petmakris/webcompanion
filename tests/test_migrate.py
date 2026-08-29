@@ -3,6 +3,8 @@ from __future__ import annotations
 import json
 from pathlib import Path
 
+import pytest
+
 from webcompanion import items, paths, threads
 from webcompanion.commands import migrate
 from webcompanion.config import Config
@@ -31,6 +33,10 @@ def _old_workspace(root, skill, sid, slug, blocks, thread_payloads=None):
 
 
 def test_a_workspace_moves_under_its_kind(tmp_path):
+    # Checking only that the destination directory exists is not enough:
+    # make_session_dirs() creates that whole tree unconditionally, so this
+    # would still pass even if the shutil.move() were dropped entirely.
+    # Assert the actual content arrived, not just the skeleton.
     old = tmp_path / "old"
     _old_workspace(old, "annotate", "s1", "my-plan", [{"id": "b-1", "markdown": "hi"}])
     cfg = Config(workspace_root=tmp_path / "ws")
@@ -38,6 +44,9 @@ def test_a_workspace_moves_under_its_kind(tmp_path):
     result = migrate.apply(migrate.plan([old / "annotate"]), cfg, reg)
     assert result["moved"] == 1
     assert (paths.kind_root(cfg, "annotate") / "s1").is_dir()
+    dirs = reg.lookup("s1")
+    stored = items.load_all(dirs["items_dir"])
+    assert stored["b-1"]["markdown"] == "hi"
 
 
 def test_blocks_become_items(tmp_path):
@@ -87,14 +96,24 @@ def test_a_workspace_whose_content_cannot_be_read_is_marked_read_only(tmp_path):
 
 
 def test_migration_is_idempotent(tmp_path):
+    # Reusing one in-memory Registry object across both calls would prove
+    # idempotency only via registry.lookup() in memory -- it would never
+    # exercise the disk-based path (old_base/new_base existence) a real
+    # crash-and-restart depends on. Use a FRESH, rehydrated Registry for the
+    # second call, the way a restarted CLI process actually would.
     old = tmp_path / "old"
     _old_workspace(old, "annotate", "s1", "my-plan", [{"id": "b-1", "markdown": "hi"}])
     cfg = Config(workspace_root=tmp_path / "ws")
-    reg = Registry(tmp_path / "state")
-    p = migrate.plan([old / "annotate"])
-    migrate.apply(p, cfg, reg)
-    second = migrate.apply(migrate.plan([old / "annotate"]), cfg, reg)
+    state_root = tmp_path / "state"
+    reg = Registry(state_root)
+    migrate.apply(migrate.plan([old / "annotate"]), cfg, reg)
+
+    fresh = Registry(state_root)
+    fresh.rehydrate()
+    second = migrate.apply(migrate.plan([old / "annotate"]), cfg, fresh)
     assert second["moved"] == 0
+    assert second["recovered"] == 0
+    assert second["already_done"] == 1
 
 
 def test_plan_reports_what_it_will_do_without_touching_anything(tmp_path):
@@ -208,3 +227,73 @@ def test_into_copies_and_leaves_every_source_untouched(tmp_path):
     stored = items.load_all(dirs["items_dir"])
     assert stored["b-1"]["markdown"] == "hi"
     assert threads.list_versions(dirs["threads_dir"]) == {"a.py:R:1": 1}
+
+
+def test_a_crash_between_move_and_registration_is_recovered_on_retry(tmp_path, monkeypatch):
+    # Reproduces the Critical: kill the process between shutil.move landing
+    # the data at the destination and registry.create() writing the row
+    # that makes it findable. A naive retry that keys "already done" off
+    # old_base being gone would classify this orphan as finished forever.
+    old = tmp_path / "old"
+    _old_workspace(old, "annotate", "s1", "my-plan", [{"id": "b-1", "markdown": "hi"}])
+    cfg = Config(workspace_root=tmp_path / "ws")
+    state_root = tmp_path / "state"
+    reg = Registry(state_root)
+
+    real_create = Registry.create
+
+    def boom(self, *a, **kw):
+        raise RuntimeError("simulated crash after the move, before registration")
+
+    monkeypatch.setattr(Registry, "create", boom)
+
+    rows = migrate.plan([old / "annotate"])
+    with pytest.raises(RuntimeError):
+        migrate.apply(rows, cfg, reg)
+
+    # The crash reproduced the reported symptom exactly: data moved, source
+    # gone, nothing registered.
+    dest = paths.kind_root(cfg, "annotate") / "s1"
+    assert dest.is_dir()
+    assert not (old / "annotate" / "workspaces" / "s1").exists()
+
+    monkeypatch.setattr(Registry, "create", real_create)
+
+    # A fresh, rehydrated Registry -- the way a restarted CLI process would
+    # see the world -- knows nothing about s1 either.
+    fresh = Registry(state_root)
+    fresh.rehydrate()
+    assert fresh.lookup("s1") is None
+
+    result = migrate.apply(migrate.plan([old / "annotate"]), cfg, fresh)
+
+    assert result["recovered"] == 1
+    assert result["moved"] == 0        # no transfer happened this run -- it was already there
+    assert result["already_done"] == 0
+    assert fresh.resolve("my-plan", kind="annotate") == "s1"
+    stored = items.load_all(fresh.lookup("s1")["items_dir"])
+    assert stored["b-1"]["markdown"] == "hi"
+
+
+def test_both_source_and_destination_present_is_left_for_a_human(tmp_path):
+    # Neither side is registered, but data sits on both sides -- there is no
+    # safe way to guess which copy is authoritative. Must not silently move
+    # or silently drop either one.
+    old = tmp_path / "old"
+    _old_workspace(old, "annotate", "s1", "my-plan", [{"id": "b-1", "markdown": "hi"}])
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")
+
+    dest = paths.kind_root(cfg, "annotate") / "s1"
+    dest.mkdir(parents=True)
+    (dest / "sentinel.txt").write_text("something already here, unrelated")
+
+    result = migrate.apply(migrate.plan([old / "annotate"]), cfg, reg)
+
+    assert result["needs_attention"] == 1
+    assert result["moved"] == 0
+    assert result["recovered"] == 0
+    assert reg.lookup("s1") is None
+    # Neither side was touched.
+    assert (old / "annotate" / "workspaces" / "s1").is_dir()
+    assert (dest / "sentinel.txt").exists()
