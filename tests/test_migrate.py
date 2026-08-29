@@ -164,3 +164,47 @@ def test_threads_move_into_the_new_threads_dir(tmp_path):
         "a.py:R:10": 1,
         "a.py:R:20": 2,
     }
+
+
+def test_plan_reports_the_resolved_absolute_source_path(tmp_path):
+    # The exact line that would have prevented the real-data incident: a
+    # copied registry still names the ORIGINAL absolute directories inside
+    # its sessions.json, so old_base here is not "wherever old_roots points"
+    # -- it is the literal absolute path apply() will touch.
+    old = tmp_path / "old"
+    _old_workspace(old, "annotate", "s1", "my-plan", [])
+    p = migrate.plan([old / "annotate"])
+    assert p[0]["old_base"].is_absolute()
+    assert p[0]["old_base"] == old / "annotate" / "workspaces" / "s1"
+
+
+def test_into_copies_and_leaves_every_source_untouched(tmp_path):
+    old = tmp_path / "old"
+    thread_payloads = [{"anchor": "a.py:R:1", "version": 1, "messages": []}]
+    ws = _old_workspace(old, "annotate", "s1", "my-plan",
+                        [{"id": "b-1", "markdown": "hi"}],
+                        thread_payloads=thread_payloads)
+    cfg = Config(workspace_root=tmp_path / "ws")  # ignored: --into overrides the destination
+    reg = Registry(tmp_path / "state")
+    into_dir = tmp_path / "rehearsal"
+
+    before_files = {p.relative_to(ws): p.read_bytes() for p in ws.rglob("*") if p.is_file()}
+
+    result = migrate.apply(migrate.plan([old / "annotate"]), cfg, reg, into=into_dir)
+
+    # Every source file present, byte-identical, nothing removed.
+    after_files = {p.relative_to(ws): p.read_bytes() for p in ws.rglob("*") if p.is_file()}
+    assert after_files == before_files
+    assert ws.is_dir()
+    assert (old / "annotate" / "sessions.json").exists()
+
+    # A complete result landed in the target: moved/migrated counts, items
+    # converted, and dirs point under into_dir, not under cfg's workspace_root.
+    assert result["moved"] == 1
+    assert result["migrated"] == 1
+    dirs = reg.lookup("s1")
+    assert Path(dirs["items_dir"]).is_relative_to(into_dir)
+    assert not Path(dirs["items_dir"]).is_relative_to(cfg.workspace_root)
+    stored = items.load_all(dirs["items_dir"])
+    assert stored["b-1"]["markdown"] == "hi"
+    assert threads.list_versions(dirs["threads_dir"]) == {"a.py:R:1": 1}

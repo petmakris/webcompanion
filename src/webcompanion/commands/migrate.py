@@ -7,10 +7,27 @@ a user can have workspaces going back to install day and no backup. The bias
 throughout is: never lose a workspace, even one that can't be fully
 converted -- move it anyway and flag it, rather than skip it or discard it.
 
+HAZARD FOR ANYONE TESTING THIS MODULE AGAINST REAL DATA: copying an old
+root's directory tree to a scratch location does NOT isolate a run.
+`sessions.json` stores each session's directories as ABSOLUTE paths pointing
+at wherever they originally lived; copying the JSON files to a new location
+does not rewrite those paths. `plan()` pointed at a copied root still
+resolves `old_base` to the ORIGINAL, live directory, and `apply()` would
+still move it for real. This happened during Task 17 review: a copy of the
+user's five real roots was migrated as an isolation test, and it moved all
+30 real workspaces out of `~/.claude/` (recovered, byte-for-byte). The only
+safe way to rehearse this module against real data is `apply(..., into=DIR)`
+/ `webcompanion migrate --into DIR`, which copies each workspace instead of
+moving it and leaves every source untouched -- never copy the directory
+tree yourself and call `apply()` on it expecting isolation.
+
 `plan()` reads each old root's `sessions.json` / `sessions_meta.json` and
 returns rows describing what would move. It never writes, creates, or moves
 anything -- a dry run is just printing this. `apply()` is the only function
-that touches disk.
+that touches disk. Every row's `old_base` is the absolute path `plan()`
+actually resolved from the registry (not the old root it was pointed at) --
+inspect it before calling `apply()` if there is any doubt what will be
+touched.
 
 Two things changed shape between the two systems, and a migrated session
 lands in one of three states as a result:
@@ -194,19 +211,33 @@ def _relocate_threads(new_base: Path, threads_dir: Path) -> int:
     return moved
 
 
-def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry) -> dict[str, int]:
+def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry,
+          into: Path | None = None) -> dict[str, int]:
     """Perform the move `plan()` described: relocate each workspace under its
     kind, relocate its comment threads, convert an `annotate` session's
     `blocks.json` into items, and register it. See the module docstring for
     the three content outcomes (`migrated`, `needs_repush`, `read_only`).
+
+    `into`, if given, turns this into a rehearsal: every workspace is
+    COPIED into `<into>/<kind>/<sid>` instead of moved, `cfg` is ignored for
+    the purpose of choosing a destination (the destination is `into`,
+    unconditionally), and every source directory is left exactly as `plan()`
+    found it. Same plan, same conversion, same categorisation, same
+    returned summary shape -- copy versus move is the only difference. Pass
+    a throwaway `registry` for a rehearsal; this function still calls
+    `registry.persist()` on it.
 
     Idempotent two ways: a sid `registry` already knows about (same process,
     same run, or rehydrated from a prior run) is skipped, and a sid whose
     `old_base` no longer exists on disk (an earlier `--apply` already moved
     it) is skipped too -- the old `sessions.json` is never rewritten by this
     module, so that disk check is what makes re-running the CLI safe across
-    process restarts.
+    process restarts. (A rehearsal never removes `old_base`, so re-running a
+    rehearsal into the same `into` directory hits the destination-collision
+    check below instead -- rehearsals are meant to be disposable, not
+    idempotent across repeated runs into one target.)
     """
+    dest_cfg = cfgmod.Config(workspace_root=Path(into)) if into is not None else cfg
     summary = {
         "moved": 0, "migrated": 0, "needs_repush": 0, "read_only": 0,
         "already_done": 0, "errors": 0,
@@ -224,7 +255,7 @@ def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry) -> dict
             continue
 
         try:
-            new_base = paths.kind_root(cfg, kind) / sid
+            new_base = paths.kind_root(dest_cfg, kind) / sid
         except ValueError:
             summary["errors"] += 1
             continue
@@ -236,12 +267,15 @@ def apply(plan_rows: list[dict], cfg: cfgmod.Config, registry: Registry) -> dict
 
         try:
             new_base.parent.mkdir(parents=True, exist_ok=True)
-            shutil.move(str(old_base), str(new_base))
+            if into is not None:
+                shutil.copytree(str(old_base), str(new_base))
+            else:
+                shutil.move(str(old_base), str(new_base))
         except (OSError, shutil.Error):
             summary["errors"] += 1
             continue
 
-        dirs = paths.make_session_dirs(cfg, kind, sid)
+        dirs = paths.make_session_dirs(dest_cfg, kind, sid)
         _relocate_threads(new_base, dirs["threads_dir"])
 
         if kind == _ITEM_FORMAT_KIND:
@@ -292,12 +326,40 @@ def build_parser() -> argparse.ArgumentParser:
                        help="print what would move; the default")
     mode.add_argument("--apply", action="store_true",
                        help="perform the migration")
+    mode.add_argument("--into", metavar="DIR",
+                       help="rehearse safely: copy into DIR instead of moving, "
+                            "leaving every source untouched")
     return p
+
+
+def _print_summary(prefix: str, summary: dict) -> None:
+    print(f"{prefix}moved: {summary['moved']}  "
+          f"migrated: {summary['migrated']}  "
+          f"needs_repush: {summary['needs_repush']}  "
+          f"read_only: {summary['read_only']}  "
+          f"already_done: {summary['already_done']}  "
+          f"errors: {summary['errors']}")
 
 
 def run(argv: list[str]) -> int:
     args = build_parser().parse_args(argv)
     rows = plan(_default_old_roots())
+
+    if args.into:
+        if not rows:
+            print("webcompanion migrate: nothing to migrate.")
+            return 0
+        into_dir = Path(args.into)
+        # Said on every rehearsal run, unmissable, so a rehearsal is never
+        # mistaken for a completed migration or vice versa -- see the
+        # module docstring for why a directory copy alone does not isolate
+        # this from the real, live workspaces.
+        print(f"rehearsal: sources left in place -- copying into {into_dir}")
+        dest_cfg = cfgmod.Config(workspace_root=into_dir)
+        registry = Registry(into_dir / ".registry")
+        summary = apply(rows, dest_cfg, registry, into=into_dir)
+        _print_summary("rehearsal: sources left in place  --  ", summary)
+        return 1 if summary["errors"] else 0
 
     if not args.apply:
         if not rows:
@@ -310,17 +372,13 @@ def run(argv: list[str]) -> int:
             dest = paths.kind_root(cfg, row["kind"]) / row["sid"]
             print(f"{row['kind']}/{row['sid']} ({row['slug']}) -- {note}\n"
                   f"    {row['old_base']} -> {dest}")
-        print(f"\n{len(rows)} session(s) found. Re-run with --apply to migrate them.")
+        print(f"\n{len(rows)} session(s) found. Re-run with --apply to migrate them, "
+              f"or --into DIR to rehearse first.")
         return 0
 
     cfg = cfgmod.load()
     registry = Registry(paths.state_root())
     registry.rehydrate()
     summary = apply(rows, cfg, registry)
-    print(f"moved: {summary['moved']}  "
-          f"migrated: {summary['migrated']}  "
-          f"needs_repush: {summary['needs_repush']}  "
-          f"read_only: {summary['read_only']}  "
-          f"already_done: {summary['already_done']}  "
-          f"errors: {summary['errors']}")
+    _print_summary("", summary)
     return 1 if summary["errors"] else 0
