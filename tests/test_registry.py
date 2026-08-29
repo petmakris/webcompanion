@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import threading
 import time
+from pathlib import Path
 
 from webcompanion import paths
 from webcompanion.config import Config
@@ -145,6 +146,90 @@ def test_six_concurrent_creates_get_distinct_slugs(tmp_path):
 
     assert len(slugs) == 6
     assert len(set(slugs)) == 6, "concurrent creates with the same title must not collide"
+
+
+class _CheckThenActRegistry(Registry):
+    """A deliberately broken create(): read `taken` and pick a slug under the
+    lock, RELEASE it, sleep (standing in for "some bytecodes run here"), then
+    re-take the lock only to insert.
+
+    This is the shape the real create() must NOT have: computing the free
+    slug and registering it are two separate critical sections, so two
+    threads can both see the same `taken` set before either inserts. It
+    exists only to prove the concurrent-create harness below can actually
+    detect that bug — see test_broken_check_then_act_registry_produces_duplicate_slugs.
+    """
+
+    def create(self, kind: str, sid: str, dirs: dict, meta_base: dict,
+               cwd: str, explicit_slug: str = "") -> str:
+        base = (
+            self._slugify(explicit_slug)
+            or self._slugify(meta_base.get("title", ""))
+            or self._slugify(Path(cwd).name)
+            or "session"
+        )
+        with self._lock:
+            taken = {
+                m.get("slug") for m in self._meta.values()
+                if m.get("kind") == kind and m.get("slug")
+            }
+            slug = base
+            if slug in taken:
+                n = 2
+                while f"{base}-{n}" in taken:
+                    n += 1
+                slug = f"{base}-{n}"
+        # The vulnerable gap: slug is picked, but not yet registered.
+        time.sleep(0.01)
+        with self._lock:
+            self._sessions[sid] = {**dirs, "_sid": sid, "_cwd": str(cwd), "_kind": kind}
+            self._meta[sid] = {**meta_base, "slug": slug, "kind": kind,
+                               "cwd": str(cwd), "created_at": int(time.time())}
+        return slug
+
+
+def _dispatch_concurrent_creates(reg, cfg, n=6):
+    """Same harness as test_six_concurrent_creates_get_distinct_slugs, made
+    reusable so the broken and real registries are exercised identically."""
+    sids = [reg.make_sid() for _ in range(n)]
+    dirs = {sid: paths.make_session_dirs(cfg, "annotate", sid) for sid in sids}
+    slugs: list[str] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(n)
+
+    def worker(sid):
+        barrier.wait()
+        slug = reg.create("annotate", sid, dirs[sid], {"title": "My Plan"}, "/proj")
+        with lock:
+            slugs.append(slug)
+
+    threads = [threading.Thread(target=worker, args=(sid,)) for sid in sids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+    return slugs
+
+
+def test_broken_check_then_act_registry_produces_duplicate_slugs(tmp_path):
+    # This is the control: it proves the harness has real contention. If this
+    # assertion ever fails, the harness isn't forcing interleaving and every
+    # other concurrency claim in this file is worthless.
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = _CheckThenActRegistry(tmp_path / "state")
+    slugs = _dispatch_concurrent_creates(reg, cfg)
+    assert len(slugs) == 6
+    assert len(set(slugs)) < 6, "the check-then-act harness must be able to see the race it targets"
+
+
+def test_real_registry_avoids_the_check_then_act_race(tmp_path):
+    # Same harness, real Registry: pick-and-insert is inside one lock
+    # acquisition, so no duplicate slugs.
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")
+    slugs = _dispatch_concurrent_creates(reg, cfg)
+    assert len(slugs) == 6
+    assert len(set(slugs)) == 6
 
 
 def test_unregister_frees_the_slug_and_the_counter(tmp_path):
