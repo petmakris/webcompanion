@@ -78,7 +78,8 @@ def test_there_is_no_skill_specific_frame_hook():
         "the old extra= hook took a Python callable so each skill could add "
         "its own frames; a standalone daemon cannot call into client code")
     assert not any(
-        p.annotation in ("Callable", "callable") or callable(p.default)
+        p.annotation in ("Callable", "callable")
+        or (p.default is not inspect.Parameter.empty and callable(p.default))
         for p in sig.parameters.values()
     ), "serve must not accept a callable parameter of any name"
 
