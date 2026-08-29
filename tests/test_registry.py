@@ -118,6 +118,35 @@ def test_a_waiting_thread_wakes_on_change(tmp_path):
     assert out == [1]
 
 
+def test_six_concurrent_creates_get_distinct_slugs(tmp_path):
+    # Pick-and-insert must happen inside one lock acquisition. Computing a
+    # free slug, releasing the lock, then registering is check-then-act: six
+    # concurrent creates with the same title could all compute "my-plan"
+    # before any of them registers it.
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")
+    sids = [reg.make_sid() for _ in range(6)]
+    dirs = {sid: paths.make_session_dirs(cfg, "annotate", sid) for sid in sids}
+    slugs: list[str] = []
+    lock = threading.Lock()
+    barrier = threading.Barrier(6)
+
+    def worker(sid):
+        barrier.wait()
+        slug = reg.create("annotate", sid, dirs[sid], {"title": "My Plan"}, "/proj")
+        with lock:
+            slugs.append(slug)
+
+    threads = [threading.Thread(target=worker, args=(sid,)) for sid in sids]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=5)
+
+    assert len(slugs) == 6
+    assert len(set(slugs)) == 6, "concurrent creates with the same title must not collide"
+
+
 def test_unregister_frees_the_slug_and_the_counter(tmp_path):
     cfg = Config(workspace_root=tmp_path / "ws")
     reg = Registry(tmp_path / "state")
