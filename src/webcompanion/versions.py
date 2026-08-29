@@ -15,6 +15,7 @@ genuinely generic: key order is not a content change.
 """
 from __future__ import annotations
 
+import fcntl
 import hashlib
 import json
 from pathlib import Path
@@ -54,23 +55,30 @@ def derive_versions(chain_path: Path, bodies: dict[str, dict]) -> dict[str, int]
     hash, and last-writer-wins leaves identical state.
     """
     chain_path = Path(chain_path)
-    chain = _load_chain(chain_path)
-    changed = False
+    lock_path = Path(str(chain_path) + ".lock")
 
-    for stale in [k for k in chain if k not in bodies]:
-        del chain[stale]
-        changed = True
+    with open(lock_path, "a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            chain = _load_chain(chain_path)
+            changed = False
 
-    for anchor, body in bodies.items():
-        if not isinstance(anchor, str):
-            continue
-        h = body_hash(body if isinstance(body, dict) else {"_": body})
-        history = chain.setdefault(anchor, [])
-        if not history or history[-1] != h:
-            history.append(h)
-            changed = True
+            for stale in [k for k in chain if k not in bodies]:
+                del chain[stale]
+                changed = True
 
-    if changed:
-        write_text_atomic(chain_path, json.dumps(chain, indent=2))
+            for anchor, body in bodies.items():
+                if not isinstance(anchor, str):
+                    continue
+                h = body_hash(body if isinstance(body, dict) else {"_": body})
+                history = chain.setdefault(anchor, [])
+                if not history or history[-1] != h:
+                    history.append(h)
+                    changed = True
 
-    return {a: len(chain.get(a, [])) or 1 for a in bodies if isinstance(a, str)}
+            if changed:
+                write_text_atomic(chain_path, json.dumps(chain, indent=2))
+
+            return {a: len(chain[a]) for a in bodies if isinstance(a, str)}
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)

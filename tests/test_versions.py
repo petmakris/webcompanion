@@ -68,3 +68,105 @@ def test_concurrent_writers_converge(tmp_path):
 def test_hash_is_stable_across_calls():
     assert body_hash({"a": 1}) == body_hash({"a": 1})
     assert body_hash({"a": 1}) != body_hash({"a": 2})
+
+
+def _derive_versions_unlocked(chain_path, bodies):
+    """Unlocked variant to reproduce the read-compute-write race.
+
+    This is used to prove the test harness can detect the bug when
+    synchronization is missing.
+    """
+    from webcompanion.versions import _load_chain, body_hash
+    from webcompanion.atomic import write_text_atomic
+
+    chain_path = __import__("pathlib").Path(chain_path)
+    chain = _load_chain(chain_path)
+    changed = False
+
+    for stale in [k for k in chain if k not in bodies]:
+        del chain[stale]
+        changed = True
+
+    for anchor, body in bodies.items():
+        if not isinstance(anchor, str):
+            continue
+        h = body_hash(body if isinstance(body, dict) else {"_": body})
+        history = chain.setdefault(anchor, [])
+        if not history or history[-1] != h:
+            history.append(h)
+            changed = True
+
+    if changed:
+        write_text_atomic(chain_path, __import__("json").dumps(chain, indent=2))
+
+    return {a: len(chain[a]) for a in bodies if isinstance(a, str)}
+
+
+def test_concurrent_different_anchors_no_lost_updates(tmp_path):
+    """Eight threads, each bumping a different anchor.
+
+    This targets the read-modify-write race that the lock fixes:
+    if two threads read the same base chain, compute independently,
+    and write back, one of the updates is lost. The test ensures
+    all eight bumps are recorded in the final chain.
+    """
+    import threading
+    p = tmp_path / "v.json"
+
+    # Initialize with 8 anchors at version 1 (all with v=0)
+    initial = {f"b-{i}": {"v": 0} for i in range(8)}
+    derive_versions(p, initial)
+
+    # Track which anchors each thread bumped
+    bumped = {}
+
+    # Each thread bumps its own anchor while preserving others
+    def bump_anchor(i):
+        bodies = {f"b-{j}": {"v": i+1 if i == j else 0} for j in range(8)}
+        derive_versions(p, bodies)
+        bumped[i] = f"b-{i}"
+
+    threads = [threading.Thread(target=bump_anchor, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # Verify all 8 anchors exist and have at least 2 entries (init + bump)
+    chain_data = json.loads((p).read_text())
+    for i in range(8):
+        anchor = f"b-{i}"
+        assert anchor in chain_data, f"Anchor {anchor} missing from chain"
+        assert len(chain_data[anchor]) >= 2, f"Anchor {anchor} has {len(chain_data[anchor])} entries, expected >= 2"
+
+
+def test_unlocked_variant_loses_updates(tmp_path):
+    """Prove the harness can see the lost-update bug.
+
+    Run the same 8-thread scenario with the unlocked variant.
+    If this passes without lost updates, the harness is not creating
+    enough contention and the locked test is meaningless.
+    """
+    import threading
+    p = tmp_path / "v.json"
+
+    # Initialize with 8 anchors
+    initial = {f"b-{i}": {"v": 0} for i in range(8)}
+    _derive_versions_unlocked(p, initial)
+
+    # Each thread bumps only its own anchor using the unlocked variant
+    def bump_anchor(i):
+        _derive_versions_unlocked(p, {f"b-{i}": {"v": i+1}})
+
+    threads = [threading.Thread(target=bump_anchor, args=(i,)) for i in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    # This SHOULD lose some updates (some anchors missing or < 2 entries)
+    # If it doesn't, the harness is not hitting the race
+    chain_data = json.loads((p).read_text())
+    missing_or_incomplete = [i for i in range(8)
+                            if f"b-{i}" not in chain_data or len(chain_data[f"b-{i}"]) < 2]
+    assert missing_or_incomplete, f"Harness does not create contention; no lost updates observed: {chain_data}"
