@@ -63,6 +63,10 @@ _SID_ROOT_RE = re.compile(r"^/s/([^/]+)/$")
 _FINISHED_MARKER = "finished"
 _CANCELLED_MARKER = "cancelled"
 
+# The durable record of a startup sweep that failed or was refused. `doctor`
+# reads this exact filename.
+SWEEP_MARKER = "startup_sweep_failed.json"
+
 
 def _mark(state_dir: Path, name: str) -> None:
     write_text_atomic(Path(state_dir) / name, "")
@@ -161,8 +165,23 @@ class Daemon:
         host, port = self._httpd.server_address[:2]
         return f"http://{host}:{port}"
 
+    def _record_sweep_problem(self, **fields) -> None:
+        """Drop the durable marker `doctor` reads. A stderr line alone means
+        nobody learns cleanup stopped running -- launchd's log rotates and
+        nobody reads it until something else breaks."""
+        try:
+            write_text_atomic(
+                self.state_root / SWEEP_MARKER,
+                json.dumps({"when": time.time(), **fields}, indent=2),
+            )
+        except OSError:
+            pass
+
     def start(self) -> None:
-        self.registry.rehydrate()
+        # The status matters as much as the rows: an unreadable sessions.json
+        # must not read as "no sessions exist", because the stray sweep
+        # deletes precisely what no row points at. See cleanup.sweep.
+        registry_status = self.registry.rehydrate()
         # A cleanup failure must never keep the socket from binding: a
         # PermissionError or a directory vanishing mid-scan here, left
         # unguarded, means launchd's KeepAlive respawns forever with every
@@ -170,25 +189,18 @@ class Daemon:
         # that skips a sweep is strictly better than one that refuses to
         # start.
         try:
-            cleanup.sweep(self.cfg, self.registry)
+            result = cleanup.sweep(self.cfg, self.registry,
+                                   registry_status=registry_status)
         except Exception as exc:
             print("webcompanion: startup cleanup sweep failed, continuing:",
                   file=sys.stderr)
             traceback.print_exc(file=sys.stderr)
-            # A stderr line alone means nobody learns cleanup stopped
-            # running -- launchd's log rotates and nobody reads it until
-            # something else breaks. Drop a durable marker under
-            # state_root so `doctor` can surface this instead.
-            try:
-                write_text_atomic(
-                    self.state_root / "startup_sweep_failed.json",
-                    json.dumps({
-                        "when": time.time(),
-                        "error": f"{type(exc).__name__}: {exc}",
-                    }, indent=2),
-                )
-            except OSError:
-                pass
+            self._record_sweep_problem(error=f"{type(exc).__name__}: {exc}")
+        else:
+            if result.get("strays_refused"):
+                print(f"webcompanion: refused the startup stray sweep: "
+                      f"{result['strays_refused']}", file=sys.stderr)
+                self._record_sweep_problem(refused=result["strays_refused"])
         self.registry.persist()
         handler = _make_handler(self)
         self._httpd = ThreadingHTTPServer((self.cfg.bind, self.cfg.port), handler)

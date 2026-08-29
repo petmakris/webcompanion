@@ -184,11 +184,21 @@ def test_an_unreadable_kind_directory_does_not_abort_the_rest_of_the_sweep(tmp_p
 
     Makes "annotate"'s kind directory unreadable, then asserts sweep()
     still completes and still reclaims a stray sitting in "deck".
+
+    A live session is registered first so the registry is non-empty: an
+    EMPTY registry facing a populated workspace root is the C2 shape, and
+    sweep() now refuses the stray pass there rather than deleting
+    everything. That refusal is a different behaviour from the one under
+    test here.
     """
     import os
 
     cfg = Config(workspace_root=tmp_path / "ws")
     reg = Registry(tmp_path / "state")
+
+    live_sid = "251231-000000-0123456789abcdef"
+    live_dirs = paths.make_session_dirs(cfg, "deck", live_sid)
+    reg.create("deck", live_sid, live_dirs, {"title": "live"}, str(tmp_path))
 
     deck_stray = paths.kind_root(cfg, "deck") / "251231-000000-cafebabecafebabe"
     deck_stray.mkdir(parents=True)
@@ -203,4 +213,60 @@ def test_an_unreadable_kind_directory_does_not_abort_the_rest_of_the_sweep(tmp_p
         os.chmod(annotate_root, original_mode)  # tmp_path cleanup needs this back
 
     assert isinstance(summary, dict)
+    assert summary["strays_refused"] is None
     assert not deck_stray.exists()  # the readable kind was still swept
+    assert paths.base_of(live_dirs).is_dir()  # the registered one was kept
+
+
+# ── the stray pass is refused when the registry cannot be trusted ────────
+
+def test_the_stray_pass_is_refused_when_the_registry_did_not_parse(tmp_path):
+    """`sweep_strays` deletes what no row points at, so it is only as safe
+    as the registry is complete. An unreadable sessions.json means the
+    daemon has no idea what is live -- not that nothing is."""
+    from webcompanion import registry as regmod
+
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")
+    orphan = paths.kind_root(cfg, "annotate") / "251231-000000-cafebabecafebabe"
+    orphan.mkdir(parents=True)
+
+    summary = cleanup.sweep(cfg, reg, registry_status=regmod.UNREADABLE)
+
+    assert summary["strays_removed"] == 0
+    assert "could not be parsed" in summary["strays_refused"]
+    assert orphan.is_dir()
+
+
+def test_the_stray_pass_is_refused_when_an_empty_registry_faces_a_full_root(tmp_path):
+    """The second untrusted shape: every workspace would be a stray, which
+    is never a legitimate outcome of an ordinary boot."""
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")
+    orphan = paths.kind_root(cfg, "deck") / "251231-000000-cafebabecafebabe"
+    orphan.mkdir(parents=True)
+
+    summary = cleanup.sweep(cfg, reg)
+
+    assert summary["strays_removed"] == 0
+    assert "registry is empty" in summary["strays_refused"]
+    assert orphan.is_dir()
+
+
+def test_a_genuine_stray_beside_a_live_session_is_still_reclaimed(tmp_path):
+    """The negative control. Refusing on an EMPTY registry must not turn
+    into refusing always -- one live row is enough to trust the sweep, and
+    ordinary garbage collection has to keep working."""
+    cfg = Config(workspace_root=tmp_path / "ws")
+    reg = Registry(tmp_path / "state")
+    live = "251231-000000-0123456789abcdef"
+    reg.create("deck", live, paths.make_session_dirs(cfg, "deck", live),
+               {"title": "live"}, str(tmp_path))
+    orphan = paths.kind_root(cfg, "deck") / "251231-000000-cafebabecafebabe"
+    orphan.mkdir(parents=True)
+
+    summary = cleanup.sweep(cfg, reg)
+
+    assert summary["strays_refused"] is None
+    assert summary["strays_removed"] == 1
+    assert not orphan.exists()

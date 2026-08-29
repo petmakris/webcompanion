@@ -24,6 +24,24 @@ backup, so the bias throughout is: when a rule is ambiguous, do not delete.
 `prune_dead_rows`, then `sweep_strays` for every kind directory present under
 the workspace root, in that order. That order matters for self-heal (below).
 
+When the registry cannot be trusted, the stray pass is REFUSED
+--------------------------------------------------------------
+`sweep_strays` deletes what no registry row points at, so it is only ever as
+safe as the registry is complete. Two states make it incomplete, and in both
+of them an empty registry means "we do not know what is live", not "nothing
+is live":
+
+- `sessions.json` exists but did not parse (`Registry.rehydrate` returns
+  UNREADABLE). The daemon has no idea what is registered.
+- The registry is empty while the workspace root is not. Every sid-shaped
+  directory under it would be a stray, i.e. the sweep would delete
+  everything -- which is never a legitimate outcome of an ordinary boot.
+
+`sweep` refuses the stray pass in both cases and reports why in
+`strays_refused`, so `Daemon.start()` can record it in the durable marker
+`doctor` reads. `expire` and `prune_dead_rows` still run: neither deletes on
+the strength of a row's ABSENCE.
+
 Task 10 hazard
 --------------
 `server.py`'s `_mark` writes terminal markers via `write_text_atomic`, which
@@ -52,7 +70,7 @@ from pathlib import Path
 
 from webcompanion import paths
 from webcompanion.config import Config
-from webcompanion.registry import Registry
+from webcompanion.registry import UNREADABLE, Registry
 
 # Shape of server-minted sids (Registry.make_sid: "YYMMDD-HHMMSS-<16 hex>").
 # The stray sweep only ever deletes directories matching this, so a user's
@@ -173,7 +191,31 @@ def prune_dead_rows(registry: Registry) -> int:
     return removed
 
 
-def sweep(cfg: Config, registry: Registry) -> dict[str, int]:
+def _workspace_root_has_sessions(cfg: Config) -> bool:
+    """Any sid-shaped directory under any kind directory of the workspace
+    root. Answers "is there anything here the sweep could delete?"."""
+    root = paths.workspace_root(cfg)
+    if not root.is_dir():
+        return False
+    try:
+        kinds = list(root.iterdir())
+    except OSError:
+        return True  # cannot tell -- assume there is, and refuse to delete
+    for kind_dir in kinds:
+        if not kind_dir.is_dir() or not paths.VALID_KIND_RE.match(kind_dir.name):
+            continue
+        try:
+            children = list(kind_dir.iterdir())
+        except OSError:
+            return True
+        for child in children:
+            if child.is_dir() and _SID_DIR_RE.match(child.name):
+                return True
+    return False
+
+
+def sweep(cfg: Config, registry: Registry, *,
+          registry_status: str = "loaded") -> dict:
     """Run retention, dead-row pruning, and the stray sweep, in that order.
 
     Order matters: `expire` and `prune_dead_rows` can each turn a registered
@@ -182,22 +224,40 @@ def sweep(cfg: Config, registry: Registry) -> dict[str, int]:
     walk each kind directory -- so anything freed up by the first two steps
     gets reclaimed in the same pass instead of lingering until the next
     restart.
+
+    `registry_status` is what `Registry.rehydrate()` returned. The stray
+    pass is refused unless the registry can be trusted -- see "When the
+    registry cannot be trusted" in the module docstring. `strays_refused`
+    in the returned summary is None when the pass ran, and a human-readable
+    reason when it did not.
     """
     expired = expire(cfg, registry)
     dead_rows_pruned = prune_dead_rows(registry)
+
+    refused: str | None = None
+    if registry_status == UNREADABLE:
+        refused = (f"{registry.sessions_file} exists but could not be parsed; "
+                   f"the daemon cannot tell which workspaces are live")
+    elif not registry.items() and _workspace_root_has_sessions(cfg):
+        refused = (f"the registry is empty but {paths.workspace_root(cfg)} "
+                   f"still holds session directories; every one of them would "
+                   f"have been deleted as a stray")
+
     strays_removed = 0
-    root = paths.workspace_root(cfg)
-    if root.is_dir():
-        try:
-            children = list(root.iterdir())
-        except OSError:
-            children = []  # can't read the workspace root -- skip strays
-        for child in children:
-            if not child.is_dir() or not paths.VALID_KIND_RE.match(child.name):
-                continue
-            strays_removed += sweep_strays(cfg, child.name, registry)
+    if refused is None:
+        root = paths.workspace_root(cfg)
+        if root.is_dir():
+            try:
+                children = list(root.iterdir())
+            except OSError:
+                children = []  # can't read the workspace root -- skip strays
+            for child in children:
+                if not child.is_dir() or not paths.VALID_KIND_RE.match(child.name):
+                    continue
+                strays_removed += sweep_strays(cfg, child.name, registry)
     return {
         "expired": expired,
         "dead_rows_pruned": dead_rows_pruned,
         "strays_removed": strays_removed,
+        "strays_refused": refused,
     }

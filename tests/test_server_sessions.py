@@ -120,7 +120,7 @@ def test_the_daemon_boots_and_serves_even_when_the_startup_sweep_raises(tmp_path
     silent respawn loop with every client seeing connection refused and
     nothing saying why. A daemon that skips a sweep must still boot.
     """
-    def _boom(cfg, registry):
+    def _boom(cfg, registry, **kw):
         raise PermissionError("simulated: cleanup sweep failed")
 
     monkeypatch.setattr(cleanup, "sweep", _boom)
@@ -140,7 +140,7 @@ def test_the_daemon_boots_and_serves_even_when_the_startup_sweep_raises(tmp_path
 def test_a_swallowed_startup_sweep_failure_leaves_a_durable_marker(tmp_path, monkeypatch):
     """A stderr traceback alone means nobody learns cleanup stopped running
     -- `doctor` needs something durable under state_root to report."""
-    def _boom(cfg, registry):
+    def _boom(cfg, registry, **kw):
         raise PermissionError("simulated: cleanup sweep failed")
 
     monkeypatch.setattr(cleanup, "sweep", _boom)

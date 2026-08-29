@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import threading
 import time
 from pathlib import Path
@@ -240,3 +241,91 @@ def test_unregister_frees_the_slug_and_the_counter(tmp_path):
     reg.unregister(sid)
     assert reg.resolve(slug, kind="annotate") is None
     assert sid not in reg._counters, "a never-restarting process must not leak per-session state"
+
+
+# ── persist merges under a cross-process lock ────────────────────────────
+
+def test_persist_keeps_rows_another_process_added(tmp_path):
+    """Two Registry objects on one state root stand in for the daemon and
+    `webcompanion migrate`. The one that writes second must not erase the
+    first's rows -- that erasure is what deleted every migrated workspace."""
+    cfg = Config(workspace_root=tmp_path / "ws")
+    state = tmp_path / "state"
+
+    daemon_side = Registry(state)
+    other_side = Registry(state)
+
+    a = "250101-120000-aaaaaaaaaaaaaaaa"
+    b = "250101-120001-bbbbbbbbbbbbbbbb"
+    daemon_side.create("annotate", a, paths.make_session_dirs(cfg, "annotate", a),
+                       {"title": "A"}, str(tmp_path))
+    other_side.create("deck", b, paths.make_session_dirs(cfg, "deck", b),
+                      {"title": "B"}, str(tmp_path))
+
+    other_side.persist()
+    daemon_side.persist()  # second writer, knows nothing about b
+
+    rows = json.loads((state / "sessions.json").read_text())
+    assert set(rows) == {a, b}
+    meta = json.loads((state / "sessions_meta.json").read_text())
+    assert meta[b]["title"] == "B"
+
+
+def test_persist_serialises_concurrent_writers(tmp_path):
+    """The flock is the point: without it, interleaved read-modify-write
+    loses rows even when each writer merges."""
+    import threading
+
+    cfg = Config(workspace_root=tmp_path / "ws")
+    state = tmp_path / "state"
+    sids = [f"250101-1200{i:02d}-{i:016x}" for i in range(12)]
+
+    def writer(sid):
+        reg = Registry(state)
+        reg.rehydrate()
+        reg.create("annotate", sid, paths.make_session_dirs(cfg, "annotate", sid),
+                   {"title": sid}, str(tmp_path))
+        reg.persist()
+
+    threads_ = [threading.Thread(target=writer, args=(s,)) for s in sids]
+    for t in threads_:
+        t.start()
+    for t in threads_:
+        t.join()
+
+    assert set(json.loads((state / "sessions.json").read_text())) == set(sids)
+
+
+# ── rehydrate reports what it found ──────────────────────────────────────
+
+def test_rehydrate_distinguishes_absent_from_unreadable(tmp_path):
+    """`cleanup.sweep` deletes what no row points at, so "the file is not
+    there" and "the file did not parse" cannot be the same answer."""
+    from webcompanion import registry as regmod
+
+    state = tmp_path / "state"
+    assert Registry(state).rehydrate() == regmod.ABSENT
+
+    state.mkdir(parents=True)
+    (state / "sessions.json").write_text("{not json")
+    assert Registry(state).rehydrate() == regmod.UNREADABLE
+
+    (state / "sessions.json").write_text("{}")
+    assert Registry(state).rehydrate() == regmod.LOADED
+
+
+def test_persist_preserves_an_unreadable_sessions_file(tmp_path):
+    """It is the only record of what is live; overwriting it in place
+    destroys any chance of salvaging it by hand."""
+    state = tmp_path / "state"
+    state.mkdir(parents=True)
+    (state / "sessions.json").write_text('{"250101-120000-aaaa')
+
+    reg = Registry(state)
+    reg.rehydrate()
+    reg.persist()
+
+    saved = list(state.glob("sessions.json.corrupt-*"))
+    assert len(saved) == 1
+    assert saved[0].read_text() == '{"250101-120000-aaaa'
+    assert json.loads((state / "sessions.json").read_text()) == {}
