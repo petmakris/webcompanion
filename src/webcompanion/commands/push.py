@@ -19,6 +19,7 @@ from pathlib import Path
 
 from webcompanion.client import ContractMismatch, DaemonUnreachable, HttpError
 from webcompanion.commands._common import client_from_config, preflight, report
+from webcompanion.commands.watch import resolve_session_dirs, UnknownSession
 
 MAX_PUSH_BYTES = 5 * 1024 * 1024
 
@@ -79,6 +80,12 @@ def run(argv: list[str]) -> int:
     except (DaemonUnreachable, ContractMismatch, HttpError) as e:
         return report(e)
 
+    state_dir = ""
+    try:
+        state_dir = str(resolve_session_dirs(args.kind, created["sid"])["state_dir"])
+    except UnknownSession:
+        pass  # eval output just omits WC_STATE_DIR; every other line still prints
+
     if args.eval_:
         # shlex.quote leaves a value made only of safe characters (a plain
         # sid, a loopback URL) unquoted, and single-quotes anything else --
@@ -87,6 +94,8 @@ def run(argv: list[str]) -> int:
         print(f"WC_SID={shlex.quote(created['sid'])}")
         print(f"WC_URL={shlex.quote(created['url'])}")
         print(f"WC_SLUG={shlex.quote(created['slug'])}")
+        if state_dir:
+            print(f"WC_STATE_DIR={shlex.quote(state_dir)}")
     else:
         print(created["url"])
     return 0

@@ -116,6 +116,33 @@ class Client:
         quoted = urllib.parse.quote(anchor, safe="")
         self._request("PUT", f"/s/{sid}/items/{quoted}", body)
 
+    def get_item(self, sid: str, anchor: str) -> dict:
+        quoted = urllib.parse.quote(anchor, safe="")
+        _, body = self._request("GET", f"/s/{sid}/items/{quoted}")
+        return body if isinstance(body, dict) else {}
+
+    def list_items(self, sid: str) -> dict:
+        _, body = self._request("GET", f"/s/{sid}/items")
+        return body if isinstance(body, dict) else {}
+
+    def get_thread(self, sid: str, anchor: str) -> dict:
+        quoted = urllib.parse.quote(anchor, safe="")
+        _, body = self._request("GET", f"/s/{sid}/threads/{quoted}")
+        return body if isinstance(body, dict) else {"anchor": anchor, "version": 0, "messages": []}
+
+    def append_thread(self, sid: str, anchor: str, text: str, role: str = "agent") -> dict:
+        quoted = urllib.parse.quote(anchor, safe="")
+        _, body = self._request("POST", f"/s/{sid}/threads/{quoted}",
+                                 {"text": text, "role": role})
+        return body if isinstance(body, dict) else {}
+
+    def list_sessions(self, cwd: str, kind: str | None = None) -> list[dict]:
+        query = f"?cwd={urllib.parse.quote(cwd, safe='')}"
+        if kind:
+            query += f"&kind={urllib.parse.quote(kind, safe='')}"
+        _, body = self._request("GET", f"/api/sessions{query}")
+        return body if isinstance(body, list) else []
+
     def register_assets(self, sid: str, static_root: str, entry: str | None = None) -> None:
         self._request("POST", f"/s/{sid}/api/assets",
                        {"static_root": static_root, "entry": entry})

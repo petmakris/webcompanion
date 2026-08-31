@@ -100,7 +100,7 @@ def _never_the_real_state_root(request, tmp_path, monkeypatch):
 def daemon(tmp_path):
     cfg = Config(port=0, token=mint_token(), bind="127.0.0.1",
                  workspace_root=tmp_path / "ws")
-    d = Daemon(cfg, state_root=tmp_path / "state")
+    d = Daemon(cfg, state_root=paths.state_root())
     d.start()
     try:
         yield d

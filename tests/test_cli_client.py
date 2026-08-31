@@ -80,3 +80,15 @@ def test_a_contract_mismatch_names_which_side_is_old(wired, tmp_path, monkeypatc
                    "--items", str(doc)])
     assert rc != 0
     assert "daemon" in capsys.readouterr().err
+
+
+def test_push_eval_output_includes_the_state_dir(wired, tmp_path, capsys):
+    doc = tmp_path / "doc.json"
+    doc.write_text(json.dumps({"items": {}}))
+    push.run(["--kind", "show-diff", "--cwd", str(tmp_path), "--title", "T",
+              "--items", str(doc), "--eval"])
+    out = capsys.readouterr().out
+    lines = {l.split("=", 1)[0]: l.split("=", 1)[1] for l in out.splitlines() if "=" in l}
+    assert "WC_STATE_DIR" in lines
+    from pathlib import Path
+    assert Path(lines["WC_STATE_DIR"].strip("'\"")).is_dir()
