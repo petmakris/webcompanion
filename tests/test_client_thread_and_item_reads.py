@@ -1,7 +1,5 @@
 from __future__ import annotations
 
-import json
-
 from webcompanion.commands._common import client_from_config
 
 

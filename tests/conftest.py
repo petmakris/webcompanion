@@ -98,6 +98,10 @@ def _never_the_real_state_root(request, tmp_path, monkeypatch):
 
 @pytest.fixture
 def daemon(tmp_path):
+    # state_root() is safe here only because the autouse
+    # _never_the_real_state_root fixture above has already patched it to
+    # tmp_path / "_state_root" -- combine this fixture with
+    # @pytest.mark.real_state_root and it writes into ~/.claude/webcompanion.
     cfg = Config(port=0, token=mint_token(), bind="127.0.0.1",
                  workspace_root=tmp_path / "ws")
     d = Daemon(cfg, state_root=paths.state_root())
