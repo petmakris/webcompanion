@@ -452,8 +452,18 @@ def _daemon_is_answering() -> bool:
     live and writing to the registry right now, and only an answered
     request proves that.
     """
+    from webcompanion import config as cfgmod
     from webcompanion.client import ContractMismatch
     from webcompanion.commands._common import client_from_config
+
+    # No config means this machine was never told about a daemon, so there is
+    # none of ours to be holding the legacy directories open -- migrating is
+    # safe. Asking anyway would be worse than pointless: `config.load()` falls
+    # back to the default host and port for a missing file, so the probe would
+    # find whatever else is listening there and refuse the migration on the
+    # strength of a daemon that has nothing to do with this machine's state.
+    if not cfgmod.config_path().exists():
+        return False
 
     try:
         client_from_config().health()

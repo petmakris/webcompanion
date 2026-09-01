@@ -26,7 +26,7 @@ every client kind that talks to it.
   `^[a-z][a-z0-9_-]{0,63}$`.
 
   A kind is a free-form string as far as the daemon is concerned, but the
-  five that exist have ONE canonical spelling each, and a client that pushes
+  six that exist have ONE canonical spelling each, and a client that pushes
   a different one gets a separate, invisible partition rather than an error.
   They are, exactly:
 
@@ -36,6 +36,7 @@ every client kind that talks to it.
   dataflow
   walkthrough
   interactive-review
+  show-diff
   ```
 
   Note the hyphen in `interactive-review`. `webcompanion migrate` derives a
@@ -46,6 +47,11 @@ every client kind that talks to it.
   that kind instead, and the two are different partitions to the daemon; a
   client that finds nothing under one spelling should try the other before
   concluding a session is gone.
+
+  `show-diff` is hyphenated too, and is the one kind `migrate` will never
+  produce: it never had a per-skill server or a `~/.claude/show-diff`
+  directory to migrate from, having been written against this contract in
+  the first place.
 - **Item** — one opaque JSON body addressed by a client-chosen string
   called an **anchor**. The daemon never inspects an item's shape; it
   stores the body, derives a version from its content hash, and hands both

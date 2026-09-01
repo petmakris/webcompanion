@@ -4,9 +4,16 @@ hand-copied route string -- that duplication is exactly what stranded five
 skills on five slightly-different HTTP conventions before this package
 existed.
 
-Three exceptions cover every way a call can fail, and `commands/_common.py`
-turns each into one of the three diagnostic messages a user needs:
+Four exceptions cover every way a call can fail, and `commands/_common.py`
+turns each into one of the diagnostic messages a user needs:
 
+  * `DaemonNotConfigured` -- there is no config file, so this machine has
+    no daemon of its own to talk to. Distinct from `DaemonUnreachable`:
+    unreachable means "installed, not answering", this means "never
+    installed". Raised before any socket is opened, because the default
+    host and port would otherwise point a client with no configuration at
+    whatever happens to be listening -- and loopback callers are trusted as
+    owners, so it would not merely read, it would write.
   * `DaemonUnreachable` -- refused, timed out, or any other transport
     failure. The daemon is not answering; the CLI never starts it.
   * `ContractMismatch` -- a 426. One side is running an old version; the
@@ -26,6 +33,24 @@ from webcompanion import CONTRACT
 from webcompanion.gate import CONTRACT_HEADER, WRITE_TOKEN_HEADER
 
 REQUEST_TIMEOUT_SECONDS = 10
+
+
+class DaemonNotConfigured(Exception):
+    """No config file, so there is no daemon this machine has been told about.
+
+    `config.load()` deliberately falls back to bare defaults for a missing
+    file -- that is right for the daemon's own boot, which has to mint a
+    config before one exists. It is wrong for a client: it silently aims
+    every request at the default port, and since the daemon trusts any
+    loopback caller as its owner, a client that was never configured could
+    create and overwrite sessions on a daemon it was never pointed at.
+    """
+
+    def __init__(self, path):
+        super().__init__(
+            f"no webcompanion configuration at {path}; this machine has no "
+            f"companion service installed")
+        self.path = path
 
 
 class DaemonUnreachable(Exception):

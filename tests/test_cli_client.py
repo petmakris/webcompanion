@@ -57,6 +57,39 @@ def test_a_payload_over_the_limit_is_refused_before_it_is_sent(wired, tmp_path, 
     assert "too large" in capsys.readouterr().err
 
 
+def test_no_config_never_opens_a_socket_at_all(tmp_path, monkeypatch, capsys):
+    """The regression this exists for: `config.load()` falls back to the
+    default host and port for a missing file, which is right for the daemon's
+    own boot and wrong for a client. An unconfigured client therefore aimed
+    every request at whatever was listening on the default port and -- since
+    the daemon trusts any loopback caller as its owner -- did not merely read
+    it, it created sessions on it. This suite's own "no daemon" tests wrote 19
+    real sessions into the real daemon on this machine before it was noticed.
+
+    Asserting the message is not enough: a client that connects, fails for
+    some other reason, and prints the same text would pass. So this asserts
+    the stronger property the fix actually provides -- no socket is opened.
+    """
+    import webcompanion.client as clientmod
+    from webcompanion import config as cfgmod
+
+    monkeypatch.setattr(cfgmod, "config_path", lambda: tmp_path / "nope.json")
+
+    def explode(*a, **k):
+        raise AssertionError(
+            "an unconfigured client opened a socket; it must refuse first")
+
+    monkeypatch.setattr(clientmod.urllib.request, "urlopen", explode)
+
+    doc = tmp_path / "doc.json"
+    doc.write_text(json.dumps({"items": {}}))
+    rc = push.run(["--kind", "annotate", "--cwd", str(tmp_path), "--title", "T",
+                   "--items", str(doc)])
+
+    assert rc != 0, "a push with no configuration must fail, not go looking"
+    assert "not installed" in capsys.readouterr().err
+
+
 def test_a_missing_daemon_prints_the_install_command_and_never_starts_one(
         tmp_path, monkeypatch, capsys):
     from webcompanion import config as cfgmod

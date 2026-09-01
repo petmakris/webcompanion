@@ -10,9 +10,10 @@ from __future__ import annotations
 import sys
 
 from webcompanion import config as cfgmod
-from webcompanion.client import Client, ContractMismatch, DaemonUnreachable, HttpError
+from webcompanion.client import (Client, ContractMismatch, DaemonNotConfigured,
+                                 DaemonUnreachable, HttpError)
 
-REPORTABLE = (DaemonUnreachable, ContractMismatch, HttpError)
+REPORTABLE = (DaemonNotConfigured, DaemonUnreachable, ContractMismatch, HttpError)
 
 
 def client_from_config() -> Client:
@@ -23,7 +24,12 @@ def client_from_config() -> Client:
 def report(exc) -> int:
     """One message per distinguishable failure. Requirements are the user's
     to install; ours to state clearly. Never install anything."""
-    if isinstance(exc, DaemonUnreachable) and not cfgmod.config_path().exists():
+    if isinstance(exc, DaemonNotConfigured):
+        print("webcompanion: the companion service is not installed.\n"
+              "\n"
+              "  pipx install webcompanion && webcompanion install-service\n",
+              file=sys.stderr)
+    elif isinstance(exc, DaemonUnreachable) and not cfgmod.config_path().exists():
         print("webcompanion: the companion service is not installed.\n"
               "\n"
               "  pipx install webcompanion && webcompanion install-service\n",
@@ -49,7 +55,16 @@ def preflight(client: Client):
     diagnostic has already been printed and this returns the exit code to
     use. Every command calls this before touching a session, so a down or
     mismatched daemon is reported the same way no matter which subcommand
-    found out."""
+    found out.
+
+    The configuration check comes first and never opens a socket. Without
+    it a machine with no config still gets a usable `Client` -- pointed at
+    the default host and port by `config.load()`'s fallback -- and quietly
+    reads and writes whatever daemon is listening there, which is how a
+    test suite that meant to assert "no daemon" wrote real sessions into a
+    real one instead."""
+    if not cfgmod.config_path().exists():
+        return report(DaemonNotConfigured(cfgmod.config_path()))
     try:
         client.health()
     except REPORTABLE as e:
