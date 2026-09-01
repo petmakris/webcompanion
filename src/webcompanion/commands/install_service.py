@@ -77,7 +77,10 @@ def default_log_path(label: str = DEFAULT_LABEL) -> Path:
 
 
 def _read_template(name: str) -> str:
-    with as_file(files("webcompanion").joinpath("service", name)) as p:
+    # Chained for the same reason as server.py's _static_file: multi-argument
+    # joinpath is not available on zipfile.Path before 3.12, and anything
+    # reached through files() may be one.
+    with as_file(files("webcompanion").joinpath("service").joinpath(name)) as p:
         return p.read_text()
 
 

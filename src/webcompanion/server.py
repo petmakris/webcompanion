@@ -122,7 +122,13 @@ def _static_file(name: str):
     asset (core.js, shell.html). importlib.resources.as_file works whether
     the package is an installed wheel or the zipapp the service ships as in
     Task 16 -- Path(__file__).parent does not survive the latter."""
-    return as_file(files("webcompanion").joinpath("static", name))
+    # Chained, not joinpath("static", name). Multi-argument joinpath arrived
+    # in 3.12 for zipfile.Path, and the installed service is a zipapp — so
+    # files() hands back a zipfile.Path, whose 3.9 version takes exactly one
+    # segment. The multi-argument form works in every test (a source checkout
+    # gives a pathlib.Path) and fails only once installed, on the 3.9 the
+    # launchd job actually runs. Chaining is correct on every version of both.
+    return as_file(files("webcompanion").joinpath("static").joinpath(name))
 
 
 def _write_asset_root(base: Path, static_root: str, entry: str | None) -> None:
