@@ -164,6 +164,7 @@ POST   /s/{sid}/threads/<anchor>
 POST   /s/{sid}/api/threads/delete
 POST   /s/{sid}/api/finish
 POST   /s/{sid}/api/cancel
+POST   /s/{sid}/api/unfinish
 ```
 
 `{sid}` is a session id or its slug. A slug is unique **within a kind**,
@@ -203,6 +204,7 @@ once URL-decoded. **write** means the ownership check applies.
 | POST | `/s/{sid}/api/threads/delete` | write | Delete one thread. Body: `{anchor}`. Returns `200 {deleted: bool}` — `false` simply means there was nothing there. A POST rather than a DELETE because the anchor travels in the body: an anchor may contain characters that look like path separators. |
 | POST | `/s/{sid}/api/finish` | write | Mark the session finished. Ends its SSE streams (a `session-ended` frame, then close). |
 | POST | `/s/{sid}/api/cancel` | write | Mark the session cancelled. Same effect on streams as finish; the two states are reported separately by `/poll`, as `finished` and `cancelled`. `/health` reports neither — it counts sessions and says nothing about their state. |
+| POST | `/s/{sid}/api/unfinish` | write | Undo a `finish`/`cancel`, whether it was manual or automatic: removes the `finished`/`cancelled` marker(s) and the watcher heartbeat file, whichever are present. Idempotent — calling it on a session that is already live is `200 {ok: true}`, not an error. Removing the heartbeat too (not just the markers) matters because a heartbeat that predates the un-finish reads as stale to a polling client, which would otherwise re-latch the session as ended on its very next poll; deleting it restores the same "no watcher yet" state a session that never had one is in. |
 
 Every session-scoped route resolves `{sid}` against the daemon's registry
 first; an unresolvable id or slug is `404 no such session` for every one

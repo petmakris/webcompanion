@@ -4,7 +4,7 @@ import json
 
 import pytest
 
-from webcompanion.commands import end, push, update
+from webcompanion.commands import end, push, unfinish, update
 
 
 def test_push_creates_a_session_and_prints_the_url(wired, tmp_path, capsys):
@@ -46,6 +46,16 @@ def test_end_finishes_the_session(wired, tmp_path, capsys):
               "--items", str(doc), "--eval"])
     sid = [l for l in capsys.readouterr().out.splitlines() if l.startswith("WC_SID=")][0][7:]
     assert end.run(["--sid", sid]) == 0
+
+
+def test_unfinish_reopens_a_finished_session(wired, tmp_path, capsys):
+    doc = tmp_path / "doc.json"
+    doc.write_text(json.dumps({"items": {}}))
+    push.run(["--kind", "annotate", "--cwd", str(tmp_path), "--title", "T",
+              "--items", str(doc), "--eval"])
+    sid = [l for l in capsys.readouterr().out.splitlines() if l.startswith("WC_SID=")][0][7:]
+    assert end.run(["--sid", sid]) == 0
+    assert unfinish.run(["--sid", sid]) == 0
 
 
 def test_a_payload_over_the_limit_is_refused_before_it_is_sent(wired, tmp_path, capsys):

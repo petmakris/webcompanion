@@ -81,6 +81,70 @@ def test_cancel_marks_the_session(call):
     assert poll["cancelled"] is True
 
 
+def test_unfinish_clears_the_finished_marker(call):
+    _, s = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})
+    sid = s["sid"]
+    call("POST", f"/s/{sid}/api/finish")
+    assert call("GET", f"/s/{sid}/poll")[1]["finished"] is True
+
+    assert call("POST", f"/s/{sid}/api/unfinish")[0] == 200
+    _, poll = call("GET", f"/s/{sid}/poll")
+    assert poll["finished"] is False
+
+
+def test_unfinish_clears_the_cancelled_marker(call):
+    _, s = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})
+    sid = s["sid"]
+    call("POST", f"/s/{sid}/api/cancel")
+    assert call("GET", f"/s/{sid}/poll")[1]["cancelled"] is True
+
+    assert call("POST", f"/s/{sid}/api/unfinish")[0] == 200
+    _, poll = call("GET", f"/s/{sid}/poll")
+    assert poll["cancelled"] is False
+
+
+def test_unfinish_on_an_already_live_session_is_a_noop_success(call):
+    _, s = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})
+    sid = s["sid"]
+    assert call("POST", f"/s/{sid}/api/unfinish")[0] == 200
+    _, poll = call("GET", f"/s/{sid}/poll")
+    assert poll["finished"] is False
+    assert poll["cancelled"] is False
+
+
+def test_unfinish_clears_the_stale_watcher_heartbeat(daemon, call):
+    """Confirmed by reading ide-plugin's ReviewSessionClient.pollLiveness: a
+    heartbeat older than its 180s REAP_AFTER_MS reads as `ended` and latches
+    that verdict permanently for the sid, while a missing heartbeat reads as
+    "not dead, leave alone". A session un-finished after sitting idle for
+    days still carries its old pre-finish heartbeat, which is already well
+    past that cutoff -- so unfinish must delete it, not merely leave it,
+    or the next poll from that client would immediately re-latch to ended."""
+    from webcompanion.commands import watch
+
+    _, s = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})
+    sid = s["sid"]
+    state_dir = daemon.registry.lookup(sid)["state_dir"]
+    watch.beat(state_dir)
+    call("POST", f"/s/{sid}/api/finish")
+    assert call("GET", f"/s/{sid}/poll")[1]["watcher_seen_at"] is not None
+
+    call("POST", f"/s/{sid}/api/unfinish")
+    _, poll = call("GET", f"/s/{sid}/poll")
+    assert poll["watcher_seen_at"] is None
+
+
+def test_unfinish_without_ownership_is_rejected(daemon):
+    _, s = raw_call(daemon, "POST", "/api/sessions",
+                    {"kind": "annotate", "cwd": "/p", "title": "T"})
+    sid = s["sid"]
+    raw_call(daemon, "POST", f"/s/{sid}/api/finish")
+
+    hostile = {"Origin": "http://evil.example", "Sec-Fetch-Site": "cross-site"}
+    status, _ = raw_call(daemon, "POST", f"/s/{sid}/api/unfinish", headers=hostile)
+    assert status == 403
+
+
 def test_finished_survives_a_daemon_restart(tmp_path):
     # This is the test whose absence let a Critical through: finished state
     # was kept in a server-side dict, so an upgrade-triggered restart of the

@@ -47,6 +47,7 @@ _SID_POLL_RE = re.compile(r"^/s/([^/]+)/poll$")
 _SID_STREAM_RE = re.compile(r"^/s/([^/]+)/stream$")
 _SID_FINISH_RE = re.compile(r"^/s/([^/]+)/api/finish$")
 _SID_CANCEL_RE = re.compile(r"^/s/([^/]+)/api/cancel$")
+_SID_UNFINISH_RE = re.compile(r"^/s/([^/]+)/api/unfinish$")
 _SID_ITEMS_RE = re.compile(r"^/s/([^/]+)/items$")
 _SID_ITEM_RE = re.compile(r"^/s/([^/]+)/items/(.+)$")
 _SID_ASSETS_REGISTER_RE = re.compile(r"^/s/([^/]+)/api/assets$")
@@ -452,6 +453,9 @@ def _make_handler(daemon: Daemon):
             m = _SID_CANCEL_RE.match(path)
             if m:
                 return self._cancel(m.group(1))
+            m = _SID_UNFINISH_RE.match(path)
+            if m:
+                return self._unfinish(m.group(1))
             m = _SID_ASSETS_REGISTER_RE.match(path)
             if m:
                 resolved, dirs = self._session(m.group(1))
@@ -566,6 +570,43 @@ def _make_handler(daemon: Daemon):
             if resolved is None:
                 return
             _mark(Path(dirs["state_dir"]), _CANCELLED_MARKER)
+            daemon.registry.note_change(resolved)
+            self._json(200, {"ok": True})
+
+        def _unfinish(self, sid: str) -> None:
+            """Undo a `finish`/`cancel` that turns out to have been premature.
+
+            Idempotent: removing a marker that is not there is success, not
+            an error, because auto-expiry (and a person) may call this on a
+            session that is already live.
+
+            Also removes the watcher heartbeat file, not just the two
+            terminal markers. Evidence, not a guess: the IDE plugin's
+            `ReviewSessionClient.pollLiveness` (ide-plugin's own
+            `ReviewSessionClient.java`) treats a *stale* heartbeat --
+            present but older than its 180s `REAP_AFTER_MS` -- as `ended`
+            and latches that verdict permanently for the sid ("nothing
+            un-freezes the same sid"), whereas a *missing* heartbeat
+            (`seenAt <= 0`) is read as "not dead, leave alone", the same
+            state a session that never had a watcher is in. A session
+            un-finished after sitting idle for days still carries its last
+            pre-finish heartbeat, which is already far past that 180s
+            cutoff -- leaving it in place would make the client re-latch
+            to ended the moment it next polls, undoing the un-finish from
+            the client's point of view. Deleting it restores the
+            unambiguous "no watcher yet" state instead.
+            """
+            if not self._require_owner():
+                return
+            resolved, dirs = self._session(sid)
+            if resolved is None:
+                return
+            state_dir = Path(dirs["state_dir"])
+            for marker in (_FINISHED_MARKER, _CANCELLED_MARKER, _HEARTBEAT_FILE):
+                try:
+                    (state_dir / marker).unlink()
+                except FileNotFoundError:
+                    pass
             daemon.registry.note_change(resolved)
             self._json(200, {"ok": True})
 

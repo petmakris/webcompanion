@@ -177,3 +177,7 @@ class Client:
 
     def cancel(self, sid: str) -> None:
         self._request("POST", f"/s/{sid}/api/cancel")
+
+    def unfinish(self, sid: str) -> dict:
+        _, body = self._request("POST", f"/s/{sid}/api/unfinish")
+        return body if isinstance(body, dict) else {}
