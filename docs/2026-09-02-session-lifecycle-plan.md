@@ -153,10 +153,13 @@ idle threshold's exact value, and whether `unfinish` should touch the watcher he
 
 **Interfaces:**
 - Consumes: `_last_activity` (existing, in `cleanup.py` — reuse verbatim, do not redefine
-  idleness a second way), `_mark`/`_FINISHED_MARKER` (existing).
-- Produces: `expire_idle(cfg: Config, registry: Registry) -> int` (returns count marked
-  finished, mirroring `expire()`'s own return-count convention), a new `Config` field for the
-  idle threshold, a periodic background sweep wired into `Daemon.start()`.
+  idleness a second way). `_mark`/`_FINISHED_MARKER`/`_is_terminal` (existing, in `server.py`)
+  are NOT imported into `cleanup.py` — see Step 2's circular-import fix — they're passed into
+  `expire_idle` as parameters from its one call site in `server.py`, which already defines all
+  three itself.
+- Produces: `expire_idle(cfg: Config, registry: Registry, *, is_terminal, mark_finished) -> int`
+  (returns count marked finished, mirroring `expire()`'s own return-count convention), a new
+  `Config` field for the idle threshold, a periodic background sweep wired into `Daemon.start()`.
 
 - [ ] **Step 1: Resolve the idle-threshold value with real evidence, not a guess**
 
@@ -182,39 +185,71 @@ idle threshold's exact value, and whether `unfinish` should touch the watcher he
 
 - [ ] **Step 2: Add `expire_idle` to `cleanup.py`**
 
-  Modelled on `expire()`'s own structure (iterate `registry.items()`, use `_last_activity`,
-  wrap deletions/writes in `try/except OSError`, return a count) but marking `finished` via
-  `_mark` instead of `shutil.rmtree`-ing anything, and — critically — **skipping any session
-  that is already `finished` or `cancelled`** (reuse `_is_terminal`, imported from `server.py`
-  or wherever it can be reached without a circular import — check `cleanup.py`'s current
-  imports first). Only ever acts on sessions that are still live.
+  **Confirmed during this plan's own pre-dispatch review — a real circular import, not a
+  hypothetical one: do not import from `server.py` into `cleanup.py`.** `cleanup.py`'s current
+  imports are `paths`, `config.Config`, `registry.{UNREADABLE, Registry}` — it has NO dependency
+  on `server.py` today. But `server.py` already does `from webcompanion import ... cleanup ...`
+  (line 33) to call the existing one-shot `cleanup.sweep()`. Adding `from webcompanion.server
+  import _is_terminal, _FINISHED_MARKER, _mark` (or similar) into `cleanup.py` would create
+  `server → cleanup → server`, an import cycle — Python would raise `ImportError` on whichever
+  module loads second, not fail silently, so this would be caught immediately by the test suite,
+  but fix it correctly from the start rather than discovering it that way.
+
+  **Resolution: dependency injection, not a shared import.** `expire_idle` takes the
+  terminal-check and marking behavior as parameters, keeping `cleanup.py`'s existing
+  zero-dependency-on-`server.py` property intact — `server.py` (which already owns
+  `_is_terminal`/`_mark`/the marker constants) passes them in at the one call site inside
+  `Daemon.start()`'s periodic sweep (Step 3), the same way it already passes `cfg`/`registry`:
 
   ```python
-  def expire_idle(cfg: Config, registry: Registry) -> int:
+  def expire_idle(cfg: Config, registry: Registry, *,
+                  is_terminal, mark_finished) -> int:
       """Mark `finished` any live session idle past `cfg.<idle_threshold_field>`.
 
-      Unlike `expire()`, this never deletes anything -- it only ever writes the
-      same marker file `webcompanion end` already writes, and only ever touches
-      a session that isn't already finished/cancelled. Safety net for skills
-      that never call `end` themselves; see docs/2026-09-02-session-lifecycle-design.md.
+      Unlike `expire()`, this never deletes anything -- it only ever calls
+      `mark_finished` (the same marker-file write `webcompanion end` already
+      performs), and only ever touches a session `is_terminal` reports as not
+      already finished/cancelled. Safety net for skills that never call `end`
+      themselves; see docs/2026-09-02-session-lifecycle-design.md.
+
+      `is_terminal`/`mark_finished` are injected (not imported from `server.py`)
+      to keep this module's existing independence from `server.py` -- avoids
+      introducing a `server -> cleanup -> server` import cycle, since `server.py`
+      already imports `cleanup` for the existing one-shot `sweep()` call.
       """
-      # implementer: fill in per Step 1's resolved threshold/config field name
+      # implementer: fill in per Step 1's resolved threshold/config field name.
+      # is_terminal(state_dir: Path) -> bool; mark_finished(state_dir: Path) -> None
   ```
+
+  At the call site in `Daemon.start()` (Step 3), pass `is_terminal=_is_terminal,
+  mark_finished=lambda d: _mark(d, _FINISHED_MARKER)` (both already defined in `server.py`,
+  same module as the call site, so no import issue there at all).
 
 - [ ] **Step 3: Wire a periodic sweep into `Daemon.start()`**
 
-  Read `Daemon.start()` in full (`server.py`, around line 226-240) to see exactly how the
-  existing one-shot `cleanup.sweep()` call is wrapped and how the HTTP server thread is started,
-  then add a periodic call to `expire_idle` — a background thread running a `while True: sleep(N);
-  expire_idle(...)` loop is the simplest correct shape and matches this codebase's existing
-  comfort with plain threads (confirm by checking whether `Daemon` already spawns any other
-  background thread, and mirror its shutdown/lifecycle handling if so — the sweep thread must not
-  prevent the daemon from shutting down cleanly). Choose a sweep interval sensibly smaller than
-  the idle threshold itself (e.g., checking every 30-60 minutes for an idle threshold measured in
-  hours is more than sufficient resolution) — do not poll every few seconds, this is a background
-  hygiene task, not a live-latency-sensitive path. Wrap the periodic call in the same
-  "never let this stop the daemon" `try/except` discipline `cleanup.sweep()`'s own call site
-  already uses.
+  **Confirmed during this plan's own pre-dispatch review**: `Daemon` spawns exactly ONE
+  background thread today — `self._thread = threading.Thread(target=self._httpd.serve_forever,
+  daemon=True)` (`server.py:265`), started in `start()`, joined with a 5s timeout in `stop()`
+  (`server.py:268-273`). This periodic sweep will be the second. Mirror the existing thread's
+  `daemon=True` flag (so it can never block process exit even if `stop()` doesn't explicitly
+  join it) and store it as a new `self._sweep_thread` attribute alongside `self._thread`, for
+  symmetry and so `stop()` can join it too if you choose to extend `stop()` — join with a short
+  timeout the same way, or simply rely on `daemon=True` and skip joining it if that's simpler and
+  this repo's own tests don't need deterministic sweep-thread shutdown (say which you chose in
+  the report). Use a `threading.Event` for the sleep (`event.wait(interval_seconds)`) rather than
+  a bare `time.sleep` in a loop — this lets a test (or a future `stop()` extension) wake the
+  thread immediately via `event.set()` instead of waiting out a real interval, which matters for
+  Step 4's testability.
+
+  A background thread running `while not stop_event.is_set(): expire_idle(...); stop_event.wait(N)`
+  is the correct shape. Choose a sweep interval sensibly smaller than the idle threshold itself
+  (e.g., checking every 30-60 minutes for an idle threshold measured in hours is more than
+  sufficient resolution) — do not poll every few seconds, this is a background hygiene task, not
+  a live-latency-sensitive path. Wrap the periodic call in the same "never let this stop the
+  daemon" `try/except` discipline `cleanup.sweep()`'s own call site already uses (per Step 2's
+  resolution, this call site is also where `_is_terminal`/`_mark`/`_FINISHED_MARKER` are passed
+  into `expire_idle` as the `is_terminal`/`mark_finished` parameters — no import needed since
+  `server.py` already defines all three itself).
 
 - [ ] **Step 4: Write tests**
 
@@ -223,11 +258,17 @@ idle threshold's exact value, and whether `unfinish` should touch the watcher he
   still exist); a session within the threshold is untouched; an already-finished or -cancelled
   session is untouched (not double-marked, not erroring); a session whose `_last_activity` can't
   be determined is left alone (mirroring `expire()`'s own "can't tell how old it is — leave it"
-  conservative behavior). Also test the periodic-sweep wiring itself if this repo's existing test
-  patterns make that practical (check how `cleanup.sweep()`'s own startup-wiring, if tested at
-  all, is tested — mirror that approach; if `Daemon.start()`'s threading isn't practically
-  testable in this suite's existing style, say so in the report rather than forcing an awkward
-  test).
+  conservative behavior). Since `expire_idle` takes `is_terminal`/`mark_finished` as injected
+  parameters (per Step 2's circular-import fix), `cleanup.py`'s own tests can pass small local
+  fakes or the real `server._is_terminal`/`server._mark` — either is fine, since the function's
+  own contract doesn't care which; using the real ones is probably simplest and most faithful,
+  same file `expire()`'s own tests likely already import from for comparable checks. Also test
+  the periodic-sweep wiring itself if this repo's existing test patterns make that practical
+  (check how `cleanup.sweep()`'s own startup-wiring, if tested at all, is tested — mirror that
+  approach; the `threading.Event`-based sleep from Step 3 should make this practical — start a
+  real `Daemon`, set the event immediately or use a near-zero interval, confirm `expire_idle` got
+  called; if `Daemon.start()`'s threading isn't practically testable in this suite's existing
+  style even with that, say so in the report rather than forcing an awkward test).
 
 - [ ] **Step 5: Run the test suite for this task**
 
