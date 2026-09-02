@@ -323,6 +323,158 @@ def test_ordinary_garbage_collection_still_reaps_a_stray_or_two(tmp_path):
     assert not any(orphan.exists() for orphan in orphans)
 
 
+# ── expire_idle: the daemon-level auto-expiry safety net ─────────────────
+#
+# `server._is_terminal`/`server._mark` are used directly rather than local
+# fakes -- expire_idle's own contract (per its docstring) doesn't care which
+# is passed, and these are the exact callables `Daemon`'s periodic sweep
+# injects at its one real call site, so using them here is the most faithful
+# test of the actual wiring, not just of expire_idle in isolation.
+
+def _server_injections():
+    from webcompanion.server import _FINISHED_MARKER, _is_terminal, _mark
+    return _is_terminal, lambda d: _mark(d, _FINISHED_MARKER)
+
+
+def test_expire_idle_marks_a_session_idle_past_the_threshold_finished(tmp_path):
+    import os
+
+    from webcompanion.server import _is_marked, _FINISHED_MARKER
+
+    is_terminal, mark_finished = _server_injections()
+    cfg = Config(workspace_root=tmp_path / "ws", idle_expiry_hours=12)
+    reg = Registry(tmp_path / "state")
+    dirs = _session(reg, cfg, "annotate", "idle-one")
+    stale = time.time() - 3600 * 48
+    os.utime(paths.base_of(dirs), (stale, stale))
+    for key in ("items_dir", "threads_dir", "state_dir"):
+        os.utime(dirs[key], (stale, stale))
+
+    assert cleanup.expire_idle(cfg, reg, is_terminal=is_terminal,
+                               mark_finished=mark_finished) == 1
+
+    # Marked, not deleted: the directory and its contents must still exist.
+    assert paths.base_of(dirs).is_dir()
+    assert Path(dirs["items_dir"]).is_dir()
+    assert _is_marked(Path(dirs["state_dir"]), _FINISHED_MARKER)
+
+
+def test_expire_idle_leaves_a_session_within_the_threshold_untouched(tmp_path):
+    from webcompanion.server import _is_marked, _FINISHED_MARKER
+
+    is_terminal, mark_finished = _server_injections()
+    cfg = Config(workspace_root=tmp_path / "ws", idle_expiry_hours=12)
+    reg = Registry(tmp_path / "state")
+    dirs = _session(reg, cfg, "annotate", "fresh-one")
+
+    assert cleanup.expire_idle(cfg, reg, is_terminal=is_terminal,
+                               mark_finished=mark_finished) == 0
+    assert not _is_marked(Path(dirs["state_dir"]), _FINISHED_MARKER)
+
+
+def test_expire_idle_never_touches_an_already_finished_session(tmp_path):
+    import os
+
+    from webcompanion.server import _mark, _FINISHED_MARKER
+
+    is_terminal, mark_finished = _server_injections()
+    cfg = Config(workspace_root=tmp_path / "ws", idle_expiry_hours=12)
+    reg = Registry(tmp_path / "state")
+    dirs = _session(reg, cfg, "annotate", "already-finished")
+    stale = time.time() - 3600 * 48
+    os.utime(paths.base_of(dirs), (stale, stale))
+    for key in ("items_dir", "threads_dir", "state_dir"):
+        os.utime(dirs[key], (stale, stale))
+    _mark(Path(dirs["state_dir"]), _FINISHED_MARKER)
+    marker_mtime_before = (Path(dirs["state_dir"]) / _FINISHED_MARKER).stat().st_mtime
+
+    assert cleanup.expire_idle(cfg, reg, is_terminal=is_terminal,
+                               mark_finished=mark_finished) == 0
+    # Not double-marked: the marker file was never rewritten.
+    assert (Path(dirs["state_dir"]) / _FINISHED_MARKER).stat().st_mtime == marker_mtime_before
+
+
+def test_expire_idle_never_touches_an_already_cancelled_session(tmp_path):
+    import os
+
+    from webcompanion.server import _mark, _CANCELLED_MARKER
+
+    is_terminal, mark_finished = _server_injections()
+    cfg = Config(workspace_root=tmp_path / "ws", idle_expiry_hours=12)
+    reg = Registry(tmp_path / "state")
+    dirs = _session(reg, cfg, "annotate", "already-cancelled")
+    stale = time.time() - 3600 * 48
+    os.utime(paths.base_of(dirs), (stale, stale))
+    for key in ("items_dir", "threads_dir", "state_dir"):
+        os.utime(dirs[key], (stale, stale))
+    _mark(Path(dirs["state_dir"]), _CANCELLED_MARKER)
+
+    assert cleanup.expire_idle(cfg, reg, is_terminal=is_terminal,
+                               mark_finished=mark_finished) == 0
+    from webcompanion.server import _FINISHED_MARKER, _is_marked
+    assert not _is_marked(Path(dirs["state_dir"]), _FINISHED_MARKER)
+
+
+def test_expire_idle_leaves_a_session_alone_when_activity_cannot_be_determined(tmp_path):
+    """Mirrors expire()'s own conservative behaviour: a session whose
+    base/items/threads/state directories are all gone (nothing left to stat)
+    is left alone rather than guessed at."""
+    import shutil
+
+    is_terminal, mark_finished = _server_injections()
+    cfg = Config(workspace_root=tmp_path / "ws", idle_expiry_hours=12)
+    reg = Registry(tmp_path / "state")
+    dirs = _session(reg, cfg, "annotate", "unreadable-one")
+    shutil.rmtree(paths.base_of(dirs))
+
+    assert cleanup.expire_idle(cfg, reg, is_terminal=is_terminal,
+                               mark_finished=mark_finished) == 0
+
+
+def test_expire_idle_does_nothing_when_unconfigured(tmp_path):
+    import os
+
+    is_terminal, mark_finished = _server_injections()
+    cfg = Config(workspace_root=tmp_path / "ws", idle_expiry_hours=None)
+    reg = Registry(tmp_path / "state")
+    dirs = _session(reg, cfg, "annotate", "would-be-idle")
+    stale = time.time() - 3600 * 24 * 30
+    os.utime(paths.base_of(dirs), (stale, stale))
+    for key in ("items_dir", "threads_dir", "state_dir"):
+        os.utime(dirs[key], (stale, stale))
+
+    assert cleanup.expire_idle(cfg, reg, is_terminal=is_terminal,
+                               mark_finished=mark_finished) == 0
+    from webcompanion.server import _FINISHED_MARKER, _is_marked
+    assert not _is_marked(Path(dirs["state_dir"]), _FINISHED_MARKER)
+
+
+def test_expire_idle_ignores_small_local_fakes_too(tmp_path):
+    """The function's contract doesn't care which callables are passed --
+    small local fakes work exactly like the real server ones."""
+    import os
+
+    calls = []
+
+    def fake_is_terminal(state_dir):
+        return False
+
+    def fake_mark_finished(state_dir):
+        calls.append(Path(state_dir))
+
+    cfg = Config(workspace_root=tmp_path / "ws", idle_expiry_hours=1)
+    reg = Registry(tmp_path / "state")
+    dirs = _session(reg, cfg, "annotate", "fake-injected")
+    stale = time.time() - 3600 * 5
+    os.utime(paths.base_of(dirs), (stale, stale))
+    for key in ("items_dir", "threads_dir", "state_dir"):
+        os.utime(dirs[key], (stale, stale))
+
+    assert cleanup.expire_idle(cfg, reg, is_terminal=fake_is_terminal,
+                               mark_finished=fake_mark_finished) == 1
+    assert calls == [Path(dirs["state_dir"])]
+
+
 def test_a_lone_stray_under_a_kind_is_still_reaped(tmp_path):
     """The floor in the shrink rule, asserted. One live row and one stray is
     100% of the directories the sweep would delete being strays, which the

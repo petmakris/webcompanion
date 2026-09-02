@@ -224,6 +224,58 @@ def test_a_swallowed_startup_sweep_failure_leaves_a_durable_marker(tmp_path, mon
         d.stop()
 
 
+def test_daemon_start_wires_the_periodic_idle_expiry_sweep(tmp_path, monkeypatch):
+    """`Daemon.start()` spawns a second background thread (the HTTP server's
+    own thread is the first) that calls `cleanup.expire_idle` with the real
+    `is_terminal`/`mark_finished` callables `server.py` owns.
+
+    `_sweep_loop`'s shape runs one pass immediately on thread start, before
+    its first `Event.wait` -- so this waits on an `Event` the fake
+    `expire_idle` sets, rather than sleeping out a real interval or
+    depending on `sweep_interval_seconds` being tiny.
+    """
+    from webcompanion.server import _FINISHED_MARKER, _is_terminal
+
+    called = threading.Event()
+    seen: dict = {}
+
+    def _fake_expire_idle(cfg, registry, *, is_terminal, mark_finished):
+        seen["cfg"] = cfg
+        seen["registry"] = registry
+        seen["is_terminal"] = is_terminal
+        seen["mark_finished"] = mark_finished
+        called.set()
+        return 0
+
+    monkeypatch.setattr(cleanup, "expire_idle", _fake_expire_idle)
+
+    cfg = Config(port=0, token=mint_token(), bind="127.0.0.1",
+                workspace_root=tmp_path / "ws")
+    d = Daemon(cfg, state_root=tmp_path / "state")
+    d.start()
+    try:
+        assert called.wait(timeout=5), \
+            "expire_idle was never called by the periodic sweep thread"
+        assert seen["cfg"] is cfg
+        assert seen["registry"] is d.registry
+        assert seen["is_terminal"] is _is_terminal
+
+        # mark_finished is server.py's own `_mark` wrapper, not a stand-in --
+        # calling it must produce the exact marker `_finish`'s HTTP route
+        # writes.
+        probe = tmp_path / "probe_state_dir"
+        probe.mkdir()
+        seen["mark_finished"](probe)
+        assert (probe / _FINISHED_MARKER).exists()
+    finally:
+        d.stop()
+        # stop() must join the sweep thread, same as it already joins the
+        # HTTP server's -- a thread left running after stop() would keep
+        # calling a monkeypatched function that outlives this test.
+        assert d._sweep_thread is not None
+        assert not d._sweep_thread.is_alive()
+
+
 def test_supersede_ends_the_older_session_of_the_same_kind_and_cwd(call):
     _, older = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "Old"})
     _, newer = call("POST", "/api/sessions",

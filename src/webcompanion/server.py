@@ -71,6 +71,15 @@ _CANCELLED_MARKER = "cancelled"
 # reads this exact filename.
 SWEEP_MARKER = "startup_sweep_failed.json"
 
+# The idle-expiry sweep's own poll interval -- deliberately much coarser than
+# `cfg.idle_expiry_hours` (default 12h): this is a background hygiene pass,
+# not a latency-sensitive one, so checking every 30 minutes is more than
+# enough resolution against a threshold measured in hours. A constructor
+# parameter (below), not a Config field: docs/2026-09-02-session-lifecycle-
+# design.md leaves the interval to the implementation, not the user, and a
+# fixed default here is what lets tests pass a near-zero interval instead.
+DEFAULT_SWEEP_INTERVAL_SECONDS = 30 * 60
+
 
 def _mark(state_dir: Path, name: str) -> None:
     write_text_atomic(Path(state_dir) / name, "")
@@ -173,13 +182,23 @@ def _editor_command(target: Path, line: int | None) -> list[str]:
 
 
 class Daemon:
-    def __init__(self, cfg: Config, state_root: Path | None = None):
+    def __init__(self, cfg: Config, state_root: Path | None = None,
+                 sweep_interval_seconds: float = DEFAULT_SWEEP_INTERVAL_SECONDS):
         self.cfg = cfg
         self.state_root = Path(state_root) if state_root else paths.state_root()
         self.registry = Registry(self.state_root)
         self.started_at = time.time()
         self._httpd: ThreadingHTTPServer | None = None
         self._thread: threading.Thread | None = None
+        # The second background thread this daemon ever spawns (the HTTP
+        # server thread above is the first) -- see the module docstring's
+        # "No idle shutdown" note for why nothing here may exit the process.
+        # A `threading.Event` for the sleep, not `time.sleep` in a loop, so
+        # `stop()` (and a test) can wake it immediately instead of waiting
+        # out a real interval.
+        self._sweep_interval_seconds = sweep_interval_seconds
+        self._sweep_stop_event = threading.Event()
+        self._sweep_thread: threading.Thread | None = None
 
     @property
     def url(self) -> str:
@@ -266,12 +285,40 @@ class Daemon:
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
 
+        self._sweep_stop_event.clear()
+        self._sweep_thread = threading.Thread(target=self._sweep_loop, daemon=True)
+        self._sweep_thread.start()
+
+    def _run_idle_sweep(self) -> None:
+        """One idle-expiry pass, guarded the same way the startup
+        `cleanup.sweep()` call is guarded in `start()`: a bad scan here must
+        never be able to kill the background thread and silently stop the
+        safety net from running again until the next restart."""
+        try:
+            cleanup.expire_idle(
+                self.cfg, self.registry,
+                is_terminal=_is_terminal,
+                mark_finished=lambda d: _mark(d, _FINISHED_MARKER),
+            )
+        except Exception:
+            print("webcompanion: idle-expiry sweep failed, continuing:",
+                  file=sys.stderr)
+            traceback.print_exc(file=sys.stderr)
+
+    def _sweep_loop(self) -> None:
+        while not self._sweep_stop_event.is_set():
+            self._run_idle_sweep()
+            self._sweep_stop_event.wait(self._sweep_interval_seconds)
+
     def stop(self) -> None:
         if self._httpd is not None:
             self._httpd.shutdown()
             self._httpd.server_close()
         if self._thread is not None:
             self._thread.join(timeout=5)
+        self._sweep_stop_event.set()
+        if self._sweep_thread is not None:
+            self._sweep_thread.join(timeout=5)
 
 
 

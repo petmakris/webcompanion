@@ -111,6 +111,7 @@ token an IDE plugin has already saved).
 | `bind` | string | `"127.0.0.1"` | The address the daemon listens on. **Loopback is not a default to change casually:** one daemon holds sessions from *every project on the machine*, and any address beyond loopback exposes all of them, plus `/api/open` (which launches an editor) and every session's registered renderer files, to anything that can reach that address. `"::1"` is supported. |
 | `token` | string | minted on first `install-service` | The write token. A caller presenting it in `X-WebCompanion-Token` may write from anywhere; loopback callers do not need it. It is **never re-minted** on upgrade or restart — re-minting would invalidate the credential an IDE plugin has saved mid-session. Rotate it by editing this field and restarting; every saved client credential stops working at that moment, on purpose. |
 | `retention_days` | integer or `null` | `null` — **infinite** | Delete a workspace idle this many days. `null` means workspaces are never deleted by age, and that is the default deliberately: `resume <slug>` is a shipped feature, workspaces go back to install day, and there is no backup. Setting this starts deleting real data on the next daemon start. |
+| `idle_expiry_hours` | integer or `null` | `12` | Auto-mark a live session `finished` (never deleted — the same marker file `webcompanion end` writes) once it has been idle this many hours, as a safety net for skills that never call `end` themselves. Unlike `retention_days`, this ships **on**: 12 hours was picked against real production data, where every genuinely abandoned session was 1–3 days idle and none were under 6 hours, leaving a full same-day working session comfortable room before this could act on it. `null` turns the safety net off entirely. |
 | `workspace_root` | string or `null` | `null` → `~/.claude/webcompanion/workspaces` | Where session directories live. Must be an **absolute** path; a relative one is ignored in favour of the default, because it would resolve against the daemon's own working directory (`/` under launchd) rather than anywhere anyone meant. |
 
 A complete file, with every field at its default except the token:
@@ -121,6 +122,7 @@ A complete file, with every field at its default except the token:
   "bind": "127.0.0.1",
   "token": "…",
   "retention_days": null,
+  "idle_expiry_hours": 12,
   "workspace_root": null
 }
 ```

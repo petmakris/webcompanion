@@ -23,6 +23,16 @@ from pathlib import Path
 DEFAULT_PORT = 3080
 DEFAULT_BIND = "127.0.0.1"
 
+# Unlike `retention_days` (disabled by default -- see cleanup.py's module
+# docstring), auto-expiry is a safety net for skills that never call
+# `webcompanion end`, per docs/2026-09-02-session-lifecycle-design.md
+# Decision 1 -- it ships ON. 12 hours was picked against real data: of 33
+# genuinely-live sessions observed on the running daemon, 32 were 1-3 days
+# old and none were under 6 hours old, so 12 hours catches every observed
+# abandoned session while leaving more than a full same-day working session's
+# worth of headroom before a live review could be marked finished by mistake.
+DEFAULT_IDLE_EXPIRY_HOURS = 12
+
 
 @dataclass
 class Config:
@@ -30,6 +40,7 @@ class Config:
     token: str = ""
     bind: str = DEFAULT_BIND
     retention_days: int | None = None
+    idle_expiry_hours: int | None = DEFAULT_IDLE_EXPIRY_HOURS
     workspace_root: Path | None = None
 
 
@@ -59,6 +70,25 @@ def load(path: Path | None = None) -> Config:
         v = raw.get(key, default)
         return v if isinstance(v, str) else default
 
+    def _int_or_none(key: str, default):
+        """Like `_int`, but an explicit JSON `null` means "disabled",
+        distinct from the key being absent (which means "use `default`").
+
+        `_int` alone cannot make that distinction -- `raw.get(key, default)`
+        already returns `None` for an explicit `null`, same as for a missing
+        key, so both collapse onto `default`. That is harmless for
+        `retention_days`, whose default already IS `None`. It is not
+        harmless here: `idle_expiry_hours` defaults to a real number, so
+        collapsing an explicit `null` into that default would leave no way
+        to turn the safety net off from the config file at all.
+        """
+        if key not in raw:
+            return default
+        v = raw[key]
+        if v is None:
+            return None
+        return v if isinstance(v, int) and not isinstance(v, bool) else default
+
     # A relative workspace_root would resolve against the daemon's cwd, which
     # is not the directory anyone was thinking of. Scattering workspaces
     # silently is the exact failure this package exists to end, so a relative
@@ -75,6 +105,7 @@ def load(path: Path | None = None) -> Config:
         token=_str("token", ""),
         bind=_str("bind", DEFAULT_BIND),
         retention_days=_int("retention_days", None) if raw.get("retention_days") is not None else None,
+        idle_expiry_hours=_int_or_none("idle_expiry_hours", DEFAULT_IDLE_EXPIRY_HOURS),
         workspace_root=ws,
     )
 
@@ -92,6 +123,7 @@ def write(cfg: Config, path: Path | None = None) -> None:
         "token": cfg.token,
         "bind": cfg.bind,
         "retention_days": cfg.retention_days,
+        "idle_expiry_hours": cfg.idle_expiry_hours,
         "workspace_root": str(cfg.workspace_root) if cfg.workspace_root else None,
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="config.", suffix=".tmp")

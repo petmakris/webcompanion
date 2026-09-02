@@ -1,7 +1,14 @@
-"""Retention, the stray sweep, and dead-row pruning.
+"""Retention, the stray sweep, dead-row pruning, and idle auto-expiry.
 
-THIS IS A DELETION MODULE. Every function here removes a user's data with no
-backup, so the bias throughout is: when a rule is ambiguous, do not delete.
+THIS IS MOSTLY A DELETION MODULE. Every function here removes a user's data
+with no backup except `expire_idle`, the one exception -- it never deletes
+anything, it only ever marks a still-live session `finished` (the same
+marker-file write `webcompanion end` already performs). It lives in this
+module anyway because it shares `_last_activity`'s idleness definition with
+`expire`, not because it deletes anything; see its own docstring and
+docs/2026-09-02-session-lifecycle-design.md Decision 1 and Decision 4. The
+bias for every deleting function below is still: when a rule is ambiguous,
+do not delete.
 
 - `expire` only ever runs if `cfg.retention_days` is set. It defaults to
   `None` -- infinite -- because `resume <slug>` is a shipped feature and
@@ -138,6 +145,53 @@ def expire(cfg: Config, registry: Registry) -> int:
         registry.unregister(sid)
         removed += 1
     return removed
+
+
+def expire_idle(cfg: Config, registry: Registry, *,
+                 is_terminal, mark_finished) -> int:
+    """Mark `finished` any live session idle past `cfg.idle_expiry_hours`.
+
+    Unlike `expire()`, this never deletes anything -- it only ever calls
+    `mark_finished` (the same marker-file write `webcompanion end` already
+    performs), and only ever touches a session `is_terminal` reports as not
+    already finished/cancelled. Safety net for skills that never call `end`
+    themselves; see docs/2026-09-02-session-lifecycle-design.md.
+
+    `is_terminal`/`mark_finished` are injected (not imported from `server.py`)
+    to keep this module's existing independence from `server.py` -- avoids
+    introducing a `server -> cleanup -> server` import cycle, since `server.py`
+    already imports `cleanup` for the existing one-shot `sweep()` call.
+    `is_terminal(state_dir: Path) -> bool`; `mark_finished(state_dir: Path)
+    -> None`.
+
+    Idleness is measured with `_last_activity`, the exact helper `expire`
+    uses for `retention_days` -- one definition of "how stale is this
+    workspace" for the whole module. A session `_last_activity` cannot read
+    (its dirs are unreadable or missing) is left alone, the same
+    conservative "can't tell -- leave it" `expire` already applies.
+
+    Returns 0 and touches nothing if auto-expiry is unconfigured
+    (`cfg.idle_expiry_hours is None`) -- unlike `retention_days`, that is not
+    this feature's default state, but it must still be possible to switch
+    off from the config file (see `config._int_or_none`).
+    """
+    if cfg.idle_expiry_hours is None:
+        return 0
+    cutoff = time.time() - cfg.idle_expiry_hours * 3600
+    marked = 0
+    for sid, dirs in list(registry.items()):
+        state_dir = Path(dirs["state_dir"])
+        if is_terminal(state_dir):
+            continue  # already finished/cancelled -- nothing to do
+        activity = _last_activity(dirs)
+        if activity is None:
+            continue  # can't tell how idle it is -- conservative: leave it
+        if activity > cutoff:
+            continue
+        mark_finished(state_dir)
+        registry.note_change(sid)
+        marked += 1
+    return marked
 
 
 def sweep_strays(cfg: Config, kind: str, registry: Registry) -> int:
