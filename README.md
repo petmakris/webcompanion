@@ -141,6 +141,7 @@ not `0600`, and reports whether `sessions.json` beside it still parses.
 | `webcompanion push` | Create a session and load its items from a JSON file. |
 | `webcompanion update` | Replace one item's body by anchor. |
 | `webcompanion end` | Mark a session finished (or `--cancel`). |
+| `webcompanion unfinish` | Reopen a session `end` (or the `idle_expiry_hours` safety net) marked finished or cancelled — no data was ever touched, so this always works. |
 | `webcompanion watch` | Follow a session's event queue, printing one banner per event. Fails if the sid is not a registered session; it never creates one. |
 | `webcompanion ack` | Acknowledge an event by id. **Required after answering one** — see below. |
 | `webcompanion migrate` | Move workspaces out of the five older per-skill roots. |

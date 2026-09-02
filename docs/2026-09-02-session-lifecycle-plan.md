@@ -302,3 +302,11 @@ threshold decision in Task 2 Step 1 but must never be read, modified, or tested 
 - Deploying this to the actually-running production daemon (stopping it, upgrading it, and
   confirming the 33 currently-live sessions behave correctly under the new auto-expiry) is a
   separate, explicit-confirmation-gated step this plan does not perform.
+- **The first sweep runs immediately on daemon start, not after the first wait interval** —
+  `_sweep_loop` checks idleness before its first `Event.wait()`. On the eventual production
+  upgrade, this means essentially all of the real 33 currently-live, never-explicitly-closed
+  sessions (32 of which are already 1-3 days idle, well past the 12-hour default) will be marked
+  `finished` within seconds of the restart, not gradually over the following sweep cycles. This
+  is the intended safety-net behavior and every one of them is immediately recoverable via
+  `webcompanion unfinish`, but whoever performs that deployment should expect and be ready for
+  this immediate, bulk effect rather than being surprised by it.
