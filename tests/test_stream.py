@@ -111,8 +111,8 @@ def test_only_the_documented_frames_are_emitted():
     src = inspect.getsource(stream)
     emitted = set(__import__("re").findall(r'emit\("([a-z-]+)"', src))
     assert emitted <= {"connected", "item-changed", "document-changed",
-                       "thread-changed", "thread-deleted", "heartbeat",
-                       "session-ended"}
+                       "thread-changed", "thread-deleted", "event-acked",
+                       "heartbeat", "session-ended"}
 
 
 def test_the_opening_snapshot_marks_its_frames_initial(daemon, call):
@@ -166,3 +166,76 @@ def test_client_gone_treats_a_closed_fd_as_disconnected_not_an_error():
         connection = _ClosedConnection()
 
     assert stream._client_gone(_FakeHandler()) is True
+
+
+def test_an_ack_is_reported_even_when_nothing_changed(daemon, call):
+    """`event-acked` is the only frame reporting something other than content
+    moving, and that is the whole reason it exists.
+
+    Acks are files written by `webcompanion ack` without touching the daemon,
+    so they bump no version and never wake the stream's registry wait. A
+    renderer that locks its page while a comment is in flight has no other
+    evidence the comment was answered: "answered, nothing needed changing"
+    moves no item version and is otherwise indistinguishable from "still
+    working". A page stuck on that was the bug this frame closes.
+
+    Deterministic because the stream snapshots the consumed dir BEFORE it
+    emits `connected` — once the reader has that frame, any later ack is new.
+    """
+    from webcompanion.commands.ack import write_ack
+    from webcompanion import paths as paths_mod
+
+    s = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})[1]
+    sid = s["sid"]
+    dirs = paths_mod.make_session_dirs(daemon.cfg, "annotate", sid)
+
+    connected = threading.Event()
+    frames = []
+
+    def reader():
+        frames.extend(_read_frames(f"{daemon.url}/s/{sid}/stream", 2,
+                                   timeout=15, sync_event=connected))
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    assert connected.wait(10), "stream never sent its connected frame"
+
+    # No item is written at any point — the ack is the only thing that happens.
+    write_ack(dirs["consumed_dir"], "01700000000000000000-1-000000")
+    t.join(timeout=15)
+
+    acked = [data for name, data in frames if name == "event-acked"]
+    assert acked, f"no event-acked frame; got {[n for n, _ in frames]}"
+    assert acked[0]["event_id"] == "01700000000000000000-1-000000"
+
+
+def test_an_ack_written_before_the_stream_opened_is_not_replayed(daemon, call):
+    """The scan is a set difference against a snapshot, not a listing echoed
+    every tick.
+
+    Without the `last_acks` bookkeeping every connected tab would receive one
+    `event-acked` per poll interval, forever, for every ack ever written. The
+    session here already has an ack on disk before the stream opens; the only
+    frame the reader may see is the heartbeat.
+    """
+    from webcompanion.commands.ack import write_ack
+    from webcompanion import paths as paths_mod
+
+    s = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})[1]
+    sid = s["sid"]
+    dirs = paths_mod.make_session_dirs(daemon.cfg, "annotate", sid)
+    write_ack(dirs["consumed_dir"], "01700000000000000000-1-000001")
+
+    frames = []
+
+    def reader():
+        # Asks for more frames than can legitimately arrive, so the read runs
+        # to its timeout and any replay would show up.
+        frames.extend(_read_frames(f"{daemon.url}/s/{sid}/stream", 5, timeout=4))
+
+    t = threading.Thread(target=reader, daemon=True)
+    t.start()
+    t.join(timeout=12)
+
+    acked = [n for n, _ in frames if n == "event-acked"]
+    assert not acked, f"a pre-existing ack was replayed {len(acked)} times"

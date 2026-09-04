@@ -16,6 +16,7 @@ machine.
 from __future__ import annotations
 
 import json
+import os
 import select
 import socket
 import threading
@@ -35,6 +36,9 @@ POLL_SECONDS = 1.0
 
 _open = 0
 _open_lock = threading.Lock()
+
+
+ACK_SUFFIX = ".ack"
 
 
 def open_stream_count() -> int:
@@ -120,6 +124,35 @@ def serve(handler, sid: str, dirs: dict, *, registry, is_terminal) -> None:
             except (BrokenPipeError, ConnectionResetError, OSError):
                 return False
 
+        # Acks are files written directly by `webcompanion ack`, deliberately
+        # without touching the daemon (see commands/ack.py) — so they do not
+        # bump the registry version and never wake the loop below. They are
+        # therefore scanned on EVERY tick, woke or idle, not in the woke-only
+        # block further down. The cost is one scandir of a small directory per
+        # POLL_SECONDS per client, against the item pass's read-every-body:
+        # cheap enough to run unconditionally, which is the only way an ack
+        # that changes no item can ever reach the page.
+        #
+        # Without this frame a client cannot distinguish "answered, nothing
+        # needed changing" from "still working", because the only other
+        # evidence an ack happened is an item version moving. A round of pure
+        # `keep` marks produces no such move, and the page stays locked.
+        consumed_dir = Path(dirs["consumed_dir"])
+
+        def acked_event_ids() -> set:
+            try:
+                return {e.name[:-4] for e in os.scandir(consumed_dir)
+                        if e.name.endswith(ACK_SUFFIX)}
+            except (FileNotFoundError, NotADirectoryError, PermissionError):
+                return set()
+
+        # Taken BEFORE the connected frame: a client that has seen `connected`
+        # must be guaranteed that any later ack reaches it. Snapshotting after
+        # that frame leaves a window in which an ack is swallowed as
+        # already-seen — the same edge-vs-value trap the note below describes
+        # for item versions.
+        last_acks = acked_event_ids()
+
         if not emit("connected", {}):
             return
 
@@ -154,6 +187,12 @@ def serve(handler, sid: str, dirs: dict, *, registry, is_terminal) -> None:
                 # per connected client, forever.
                 emit("session-ended", {})
                 return
+
+            new_acks = acked_event_ids()
+            for event_id in sorted(new_acks - last_acks):
+                if not emit("event-acked", {"event_id": event_id}):
+                    return
+            last_acks = new_acks
 
             if not woke:
                 idle_elapsed += POLL_SECONDS

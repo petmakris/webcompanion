@@ -116,7 +116,8 @@
   // ── Live updates ────────────────────────────────────────────────────
   // The daemon's frame vocabulary is fixed: connected, item-changed
   // {anchor, version}, document-changed {version}, thread-changed
-  // {anchor, version}, thread-deleted {anchor}, heartbeat, session-ended.
+  // {anchor, version}, thread-deleted {anchor}, event-acked {event_id},
+  // heartbeat, session-ended.
   // document-changed is defined but not emitted by the daemon today, so it
   // is bound defensively and never depended on.
   //
@@ -174,6 +175,16 @@
     es.addEventListener("thread-deleted", (ev) => {
       const d = frame(ev);
       onDelta({ kind: "thread-deleted", anchor: d.anchor, version: 0, initial: false });
+    });
+    // The only frame that reports something OTHER than content moving: an
+    // event was answered. A renderer that locks its page while a comment is
+    // in flight needs this, because "answered, nothing needed changing" moves
+    // no version and is otherwise indistinguishable from "still working".
+    es.addEventListener("event-acked", (ev) => {
+      const d = parse(ev);
+      if (!d) return;
+      onDelta({ kind: "event-acked", anchor: null, version: 0, initial: false,
+                event_id: d.event_id });
     });
     es.addEventListener("session-ended", () => {
       ended = true;
