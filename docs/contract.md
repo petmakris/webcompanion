@@ -26,7 +26,7 @@ every client kind that talks to it.
   `^[a-z][a-z0-9_-]{0,63}$`.
 
   A kind is a free-form string as far as the daemon is concerned, but the
-  six that exist have ONE canonical spelling each, and a client that pushes
+  seven that exist have ONE canonical spelling each, and a client that pushes
   a different one gets a separate, invisible partition rather than an error.
   They are, exactly:
 
@@ -37,6 +37,7 @@ every client kind that talks to it.
   walkthrough
   interactive-review
   show-diff
+  atlas
   ```
 
   Note the hyphen in `interactive-review`. `webcompanion migrate` derives a
@@ -140,6 +141,7 @@ Quick reference, one line per route (method and path only — see the table
 below for what each one does and what it returns):
 
 ```
+GET    /
 GET    /health
 GET    /api/whoami
 GET    /api/sessions
@@ -180,9 +182,10 @@ once URL-decoded. **write** means the ownership check applies.
 
 | Method | Path | write | Description |
 |---|---|---|---|
+| GET | `/` | | The landing page: the kinds on this daemon as a grid, plus any session that is currently live, whatever its kind. One click (a `#<kind>` fragment, no second route) opens that kind's own sessions. HTML only — it is a browser view of `/api/sessions?scope=all` and adds no state of its own. The listing it fetches is owner-gated, so a non-owner is told so rather than shown an empty list. |
 | GET | `/health` | | Liveness and version: `{banner, contract, version, uptime, sessions}`. Never contract- or owner-gated beyond the header check every route gets. |
 | GET | `/api/whoami` | | `{writable: bool}` — whether *this* caller currently passes the ownership check. |
-| GET | `/api/sessions` | (scope=all only) | List sessions. `?cwd=<path>&kind=<kind>` (cwd required) for one project; `?scope=all` for every session on the daemon (owner only). Each row: `{sid, slug, kind, cwd, title, url}`. |
+| GET | `/api/sessions` | (scope=all only) | List sessions. `?cwd=<path>&kind=<kind>` (cwd required) for one project; `?scope=all` for every session on the daemon (owner only). Each row: `{sid, slug, kind, cwd, title, state, url}`, where `state` is `live`, `finished` or `cancelled`. (`state` was added after contract 1 shipped; it is additive, so a client written against the original six keys reads them unchanged.) |
 | GET | `/_wc/core.js` | | The daemon's packaged browser runtime (shared JS every session's page loads). |
 | POST | `/api/sessions` | write | Create a session. Body: `{kind, cwd, title?, slug?, supersede?}`. `kind` and `cwd` are required (`400` otherwise). `supersede: true` marks every other live session of the same `kind` and `cwd` as finished. Returns `201 {sid, slug, kind, url, token}` — `token` is the daemon's write token, handed to whoever just created the session. |
 | POST | `/api/open` | write | Open a file in the user's editor. Body: `{file, line?}`. `file` is resolved and then must fall inside some existing session's `cwd` (`403` otherwise) — the daemon's only subprocess capability, and this containment check is its entire defence. `404` if not a file; `500` if the editor could not be launched. |

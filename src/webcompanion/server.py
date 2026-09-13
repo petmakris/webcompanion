@@ -419,12 +419,23 @@ def _make_handler(daemon: Daemon):
 
         def _row(self, sid: str) -> dict:
             meta = daemon.registry.get_meta(sid)
+            # `state` is additive. Existing clients (two IDE plugins) read the
+            # keys they know and ignore the rest, which is why this needs no
+            # contract bump -- see docs/contract.md on additive changes.
+            dirs = daemon.registry.lookup(sid) or {}
+            state_dir = Path(dirs.get("state_dir", "")) if dirs else None
+            state = "live"
+            if state_dir is not None and _is_marked(state_dir, _CANCELLED_MARKER):
+                state = "cancelled"
+            elif state_dir is not None and _is_marked(state_dir, _FINISHED_MARKER):
+                state = "finished"
             return {
                 "sid": sid,
                 "slug": meta.get("slug", ""),
                 "kind": meta.get("kind", ""),
                 "cwd": meta.get("cwd", ""),
                 "title": meta.get("title", ""),
+                "state": state,
                 "url": f"{daemon.url}/s/{sid}/",
             }
 
@@ -434,6 +445,8 @@ def _make_handler(daemon: Daemon):
                 return
             parsed = urlsplit(self.path)
             path = parsed.path
+            if path == "/":
+                return self._index()
             if path == "/health":
                 return self._health()
             if path == "/api/whoami":
@@ -891,6 +904,14 @@ def _make_handler(daemon: Daemon):
 
         def _core_js(self) -> None:
             with _static_file("core.js") as p:
+                self._serve_file(p)
+
+        def _index(self) -> None:
+            """The landing page. `/` was a 404 for the whole of contract 1, so the
+            only way back to a workspace was a link someone had been handed once and
+            had to find again in a transcript. The page is a static read of
+            /api/sessions -- owner-gated there, as it always was."""
+            with _static_file("index.html") as p:
                 self._serve_file(p)
 
         def _get_shell(self, sid: str, dirs: dict) -> None:
