@@ -140,7 +140,9 @@ not `0600`, and reports whether `sessions.json` beside it still parses.
 | `webcompanion doctor` | The fuller diagnosis: both interpreters, the config, whether `sessions.json` parses, the zipapp, whether the service is installed *and* whether launchd/systemd knows the job, the port holder, restart count, health, and the tail of the service log. |
 | `webcompanion push` | Create a session and load its items from a JSON file. |
 | `webcompanion update` | Replace one item's body by anchor. |
+| `webcompanion assets` | Register the directory a session's page is rendered from. Idempotent; re-send it on every push so a client that has moved on disk still resolves. |
 | `webcompanion end` | Mark a session finished (or `--cancel`). |
+| `webcompanion forget` | **Delete a session and its whole workspace** — items, threads, uploads, event queue. Irreversible and there is no second copy. A live session is refused unless `--force`. Takes a slug as readily as a sid; add `--kind` when a slug exists under more than one. |
 | `webcompanion unfinish` | Reopen a session `end` (or the `idle_expiry_hours` safety net) marked finished or cancelled — no data was ever touched, so this always works. |
 | `webcompanion watch` | Follow a session's event queue, printing one banner per event. Fails if the sid is not a registered session; it never creates one. |
 | `webcompanion ack` | Acknowledge an event by id. **Required after answering one** — see below. |

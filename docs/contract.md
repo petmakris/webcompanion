@@ -149,6 +149,7 @@ GET    /_wc/core.js
 POST   /api/sessions
 POST   /api/open
 GET    /s/{sid}/
+DELETE /s/{sid}/
 GET    /s/{sid}/poll
 GET    /s/{sid}/stream
 GET    /s/{sid}/items
@@ -190,6 +191,7 @@ once URL-decoded. **write** means the ownership check applies.
 | POST | `/api/sessions` | write | Create a session. Body: `{kind, cwd, title?, slug?, supersede?}`. `kind` and `cwd` are required (`400` otherwise). `supersede: true` marks every other live session of the same `kind` and `cwd` as finished. Returns `201 {sid, slug, kind, url, token}` — `token` is the daemon's write token, handed to whoever just created the session. |
 | POST | `/api/open` | write | Open a file in the user's editor. Body: `{file, line?}`. `file` is resolved and then must fall inside some existing session's `cwd` (`403` otherwise) — the daemon's only subprocess capability, and this containment check is its entire defence. `404` if not a file; `500` if the editor could not be launched. |
 | GET | `/s/{sid}/` | | The session's HTML shell page: a minimal page that loads `/_wc/core.js` and, if a renderer has registered (see `/api/assets` below), that renderer's entry script. `404 no such session` if `sid` does not resolve. |
+| DELETE | `/s/{sid}/` | write | **Delete the session and its whole workspace** — registry row, items, threads, uploaded assets, event queue. Irreversible, with no second copy. A session that is not finished or cancelled is refused `409` unless `?force=1`: the one deletion nobody means to make is of something still running, while naming a terminal session is intent enough on its own. Refuses `409` too if the row's workspace is not where its kind's root would have put it, rather than deleting whatever the row points at. Any stream still open on the session is wound down first, so a page that is watching gets `session-ended` instead of finding its directory gone. Returns `200 {ok, sid, kind}`. |
 | GET | `/s/{sid}/poll` | | One-shot state snapshot for clients that are not holding an SSE connection: `{finished, cancelled, watcher_seen_at, items: {anchor: version}, threads: {anchor: version}}`. |
 | GET | `/s/{sid}/stream` | | Open an SSE connection. See "SSE frame vocabulary" below. `503 too many open streams` if the daemon is already holding `MAX_CONCURRENT_STREAMS` (200) connections. |
 | GET | `/s/{sid}/items` | | Snapshot of every item: `{anchor: {body, version}}`. |

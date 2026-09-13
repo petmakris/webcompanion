@@ -178,6 +178,20 @@ class Client:
     def cancel(self, sid: str) -> None:
         self._request("POST", f"/s/{sid}/api/cancel")
 
+    def forget(self, sid: str, force: bool = False, kind: str = "") -> dict:
+        """Delete a session and its whole workspace. Irreversible.
+
+        `kind` disambiguates a slug that exists under more than one kind; the
+        daemon answers 409 naming the candidates rather than picking one."""
+        from urllib.parse import quote, urlencode
+        query = {}
+        if kind:
+            query["kind"] = kind
+        if force:
+            query["force"] = "1"
+        suffix = ("?" + urlencode(query)) if query else ""
+        return self._request("DELETE", f"/s/{quote(sid, safe='')}/{suffix}")
+
     def unfinish(self, sid: str) -> dict:
         _, body = self._request("POST", f"/s/{sid}/api/unfinish")
         return body if isinstance(body, dict) else {}

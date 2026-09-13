@@ -92,7 +92,14 @@ def _is_marked(state_dir: Path, name: str) -> bool:
 def _is_terminal(state_dir: Path) -> bool:
     """Finished or cancelled — either one ends a stream. Reads the same
     files a separate watcher process polls; there is no daemon-memory
-    shortcut, because a restart must see the same answer the watcher does."""
+    shortcut, because a restart must see the same answer the watcher does.
+
+    A workspace that is GONE is terminal too. `forget` deletes the directory
+    these markers live in, and a stream still open on that session would
+    otherwise keep polling a vanished path for as long as the tab stayed open,
+    never reaching the `session-ended` frame that tells the page to stop."""
+    if not Path(state_dir).exists():
+        return True
     return _is_marked(state_dir, _FINISHED_MARKER) or _is_marked(state_dir, _CANCELLED_MARKER)
 
 
@@ -582,6 +589,12 @@ def _make_handler(daemon: Daemon):
                 if resolved is None:
                     return
                 return self._delete_item(resolved, dirs, unquote(m.group(2)))
+            m = _SID_ROOT_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._forget(resolved, dirs, parse_qs(urlsplit(self.path).query))
             self._text(404, "not found")
 
         # ── routes ──────────────────────────────────────────────────────
@@ -622,6 +635,54 @@ def _make_handler(daemon: Daemon):
             _mark(Path(dirs["state_dir"]), _FINISHED_MARKER)
             daemon.registry.note_change(resolved)
             self._json(200, {"ok": True})
+
+        def _forget(self, sid: str, dirs: dict, query: dict) -> None:
+            """Delete a session outright: its registry row and its whole
+            workspace, items, threads, uploads and all.
+
+            Until this existed there was no way to remove a session at all.
+            `finish` and `cancel` only write a marker, so a machine accumulated
+            every session it had ever served and the only way to drop one was to
+            stop the daemon and edit the registry by hand.
+
+            LIVE IS REFUSED, because the one deletion nobody means to make is of
+            something still running. `?force=1` says you mean it. A finished or
+            cancelled session needs no such flag — naming it is the intent, and a
+            wrong name is a 404 rather than the wrong deletion.
+            """
+            if not self._require_owner():
+                return
+            state_dir = Path(dirs["state_dir"])
+            forced = (query.get("force") or [""])[0] in ("1", "true", "yes")
+            if not _is_terminal(state_dir) and not forced:
+                self._text(409, "that session is still live; end it first "
+                                "(POST /s/{sid}/api/finish) or repeat with ?force=1")
+                return
+            meta = daemon.registry.get_meta(sid)
+            kind = meta.get("kind", "")
+            base = Path(paths.base_of(dirs)).resolve()
+            # Containment, the same discipline `/api/open` uses: the only path
+            # this may remove is the one this kind's own root would have built
+            # for this sid. A registry row pointing anywhere else is not a
+            # licence to delete what it points at.
+            try:
+                expected = (paths.kind_root(daemon.cfg, kind) / sid).resolve()
+            except ValueError:
+                self._text(409, "that session's kind is not one this daemon can address")
+                return
+            if base != expected:
+                self._text(409, "that session's workspace is not where its kind's root "
+                                "would have put it; refusing to delete it")
+                return
+            # Marked before it is removed, so a stream still open on it wakes,
+            # sees a terminal session and emits `session-ended` — rather than
+            # discovering a directory that is simply gone.
+            _mark(state_dir, _FINISHED_MARKER)
+            daemon.registry.note_change(sid)
+            shutil.rmtree(base, ignore_errors=True)
+            daemon.registry.unregister(sid)
+            daemon.registry.persist()
+            self._json(200, {"ok": True, "sid": sid, "kind": kind})
 
         def _cancel(self, sid: str) -> None:
             if not self._require_owner():
