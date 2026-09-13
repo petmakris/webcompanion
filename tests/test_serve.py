@@ -144,3 +144,73 @@ def test_the_port_in_use_message_points_at_the_config_file(tmp_path, monkeypatch
     err = capsys.readouterr().err
     assert str(cfg_file) in err
     assert '"port"' in err
+
+
+# ── residue on the port is not a stale process ───────────────────────────
+
+def _port_with_residue_but_no_listener():
+    """A port whose listener is gone but whose connections are still in the
+    kernel's table. This is what an open browser tab leaves behind: every page
+    holds an SSE connection, and the sockets outlive the daemon that served
+    them."""
+    listener = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    listener.bind(("127.0.0.1", 0))
+    listener.listen(1)
+    port = listener.getsockname()[1]
+    client = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    client.connect(("127.0.0.1", port))
+    accepted, _ = listener.accept()
+    listener.close()          # nothing is listening any more
+    return port, client, accepted
+
+
+def test_a_port_holding_only_closed_connections_still_fails_a_plain_bind():
+    """The premise the refusal used to rest on. Without this the next test would
+    prove nothing — it would pass on a port that was simply free."""
+    port, client, accepted = _port_with_residue_but_no_listener()
+    try:
+        assert serve._port_is_free("127.0.0.1", port) is False
+        assert serve.port_holder(port) is None
+    finally:
+        client.close()
+        accepted.close()
+
+
+def test_serve_starts_over_residue_when_no_process_is_listening(tmp_path, monkeypatch, capsys):
+    """A browser tab must not be able to take the service down. launchd restarts
+    the daemon on exit, so refusing here crashlooped it for as long as a closed
+    page's sockets lingered — and the message blamed a stale process that did
+    not exist."""
+    port, client, accepted = _port_with_residue_but_no_listener()
+    try:
+        p = tmp_path / "config.json"
+        cfgmod.write(cfgmod.Config(port=port, token="t", bind="127.0.0.1"), p)
+        monkeypatch.setattr(cfgmod, "config_path", lambda: p)
+
+        stop = threading.Event()
+        stop.set()
+        rc = serve.run([], _stop_event=stop)
+
+        assert rc == 0
+        assert "no process is listening" in capsys.readouterr().err
+    finally:
+        client.close()
+        accepted.close()
+
+
+def test_serve_still_refuses_when_it_cannot_ask_who_holds_the_port(tmp_path, monkeypatch, capsys):
+    """Without lsof, a listener and mere residue are indistinguishable, and
+    binding alongside a real listener splits traffic silently. The conservative
+    refusal is right for exactly that case and no other."""
+    port, client, accepted = _port_with_residue_but_no_listener()
+    try:
+        p = tmp_path / "config.json"
+        cfgmod.write(cfgmod.Config(port=port, token="t", bind="127.0.0.1"), p)
+        monkeypatch.setattr(cfgmod, "config_path", lambda: p)
+        monkeypatch.setattr(serve, "_can_ask_who_holds_the_port", lambda: False)
+
+        assert serve.run([]) == 1
+        assert "lsof is not available" in capsys.readouterr().err
+    finally:
+        client.close()
+        accepted.close()

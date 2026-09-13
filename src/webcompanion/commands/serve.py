@@ -50,6 +50,13 @@ def port_holder(port: int) -> tuple[str, int] | None:
         return None
 
 
+def _can_ask_who_holds_the_port() -> bool:
+    """Whether `port_holder` is able to answer at all. It returns None both for
+    "nobody is listening" and for "lsof is not installed", and those two lead to
+    opposite decisions."""
+    return shutil.which("lsof") is not None
+
+
 def _port_is_free(bind: str, port: int) -> bool:
     """A plain bind with no SO_REUSEADDR: the one check that actually
     detects a listener already on this port, which `Daemon.start()` (via
@@ -96,6 +103,19 @@ def _remove_pidfile() -> None:
 def run(argv: list[str], *, _stop_event: threading.Event | None = None) -> int:
     cfg = cfgmod.load()
 
+    # A failed plain bind is EVIDENCE, not a verdict. It fails for a listening
+    # process -- what this guard is for -- and equally for a socket merely still
+    # in the kernel's table: a half-closed connection a client has not let go of.
+    #
+    # That second case is not hypothetical here. Every open page holds an SSE
+    # connection, and a browser that outlives the daemon leaves those sockets in
+    # FIN_WAIT_2 with nothing listening behind them. Refusing then turns an open
+    # tab into an outage: launchd's KeepAlive restarts the daemon, the residue is
+    # still there, and it crashloops until the browser happens to let go.
+    #
+    # So the refusal is owned by `port_holder`, which asks lsof for a LISTENer and
+    # answers about a process rather than about a port. No listener means nothing
+    # to be stale alongside, and SO_REUSEADDR binds straight over the residue.
     if not _port_is_free(cfg.bind, cfg.port):
         holder = port_holder(cfg.port)
         if holder is not None:
@@ -103,14 +123,23 @@ def run(argv: list[str], *, _stop_event: threading.Event | None = None) -> int:
             print(f"webcompanion: port {cfg.port} is already held by "
                   f"{name} (pid {pid}); refusing to bind alongside a stale "
                   f"process.", file=sys.stderr)
-        else:
-            print(f"webcompanion: port {cfg.port} is already in use "
-                  f"(holder could not be determined); refusing to bind "
-                  f"alongside a stale process.", file=sys.stderr)
-        print(f"  change it with the \"port\" field in "
-              f"{cfgmod.config_path()} (see the README's Configuration "
-              f"section), then restart the service.", file=sys.stderr)
-        return 1
+            print(f"  change it with the \"port\" field in "
+                  f"{cfgmod.config_path()} (see the README's Configuration "
+                  f"section), then restart the service.", file=sys.stderr)
+            return 1
+        if not _can_ask_who_holds_the_port():
+            # Without lsof there is no way to tell a listener from residue, and
+            # binding alongside a real one would split traffic silently. Keep the
+            # conservative refusal for the only case that cannot be distinguished.
+            print(f"webcompanion: port {cfg.port} is already in use and lsof is "
+                  f"not available to say by what; refusing to bind alongside a "
+                  f"possible stale process.", file=sys.stderr)
+            print(f"  change it with the \"port\" field in "
+                  f"{cfgmod.config_path()} (see the README's Configuration "
+                  f"section), then restart the service.", file=sys.stderr)
+            return 1
+        print(f"webcompanion: port {cfg.port} still holds closed connections "
+              f"(no process is listening) -- binding over them.", file=sys.stderr)
 
     daemon = Daemon(cfg)
     daemon.start()
