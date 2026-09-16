@@ -30,12 +30,16 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from webcompanion import CONTRACT, __version__
-from webcompanion import anchors, cleanup, events, gate, items, paths, stream, threads, uploads
+from webcompanion import anchors, build, cleanup, events, gate, items, paths, stream, threads, uploads
 from webcompanion.atomic import write_text_atomic
 from webcompanion.config import Config
 from webcompanion.registry import Registry
 
 BANNER = f"webcompanion v{__version__}"
+
+# Resolved once, at import: hashing the package on every /health would put
+# a directory walk on the one route every client polls.
+_BUILD_ID = build.build_id()
 
 # Path patterns for the sid-scoped routes. Kept at module scope, next to the
 # dispatch that uses them, rather than folded into a computed dispatch dict —
@@ -603,6 +607,12 @@ def _make_handler(daemon: Daemon):
                 "banner": BANNER,
                 "contract": CONTRACT,
                 "version": __version__,
+                # Which CODE is running, as opposed to which release it calls
+                # itself. A daemon runs a frozen zipapp while the CLI beside
+                # it tracks a working tree, so these two can be days apart at
+                # the same `version` -- and then a route added in between
+                # answers 404 with no explanation. See `webcompanion.build`.
+                "build": _BUILD_ID,
                 "uptime": time.time() - daemon.started_at,
                 "sessions": len(daemon.registry.items()),
             })

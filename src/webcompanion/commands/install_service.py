@@ -29,6 +29,7 @@ from importlib.resources import as_file, files
 from pathlib import Path
 from xml.sax.saxutils import escape as _xml_escape
 
+from webcompanion import build as buildmod
 from webcompanion import config as cfgmod
 from webcompanion import paths
 from webcompanion.config import Config
@@ -120,6 +121,13 @@ def build_zipapp(dest: Path) -> Path:
     `webcompanion/static/core.js` alongside everything else -- the daemon
     reads its static assets through `importlib.resources`, so they must be
     inside the archive, not merely on disk next to it.
+
+    The staged copy is also stamped with its build id before it is zipped,
+    which is the only moment that id can be fixed: afterwards the archive is
+    what a daemon runs for days while the working tree moves on beneath it.
+    Without the stamp the daemon has nothing to report and `status` and
+    `preflight` have nothing to compare, so skew stays invisible until a
+    route answers 404.
     """
     dest = Path(dest)
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -131,6 +139,11 @@ def build_zipapp(dest: Path) -> Path:
                 pkg_dir, staged / "webcompanion",
                 ignore=shutil.ignore_patterns("__pycache__", "*.pyc"),
             )
+        stamped = staged / "webcompanion"
+        # Computed from the staged tree, not from the live one: what ships is
+        # what gets named, even if the working tree is edited mid-build.
+        (stamped / buildmod.STAMP_NAME).write_text(
+            buildmod.compute(stamped) + "\n")
         if dest.exists():
             dest.unlink()
         zipapp.create_archive(

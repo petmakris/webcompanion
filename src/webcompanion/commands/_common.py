@@ -9,11 +9,26 @@ from __future__ import annotations
 
 import sys
 
+from webcompanion import build
 from webcompanion import config as cfgmod
 from webcompanion.client import (Client, ContractMismatch, DaemonNotConfigured,
                                  DaemonUnreachable, HttpError)
 
 REPORTABLE = (DaemonNotConfigured, DaemonUnreachable, ContractMismatch, HttpError)
+
+
+def warn_on_build_skew(health: dict) -> None:
+    """Say so, on stderr, when the daemon is not running this CLI's code.
+
+    A warning rather than a refusal: the daemon is answering and most routes
+    predate the skew, so failing here would break working commands to report
+    a problem they do not have. What it buys is that the one command that
+    IS affected fails with its cause already printed above it, instead of a
+    bare 404 that reads as a bug in the route.
+    """
+    message = build.skew_message(health.get("build"))
+    if message:
+        print(message, file=sys.stderr)
 
 
 def client_from_config() -> Client:
@@ -66,7 +81,11 @@ def preflight(client: Client):
     if not cfgmod.config_path().exists():
         return report(DaemonNotConfigured(cfgmod.config_path()))
     try:
-        client.health()
+        health = client.health()
     except REPORTABLE as e:
         return report(e)
+    # The health response was already fetched and thrown away here, so the
+    # skew check costs no extra request -- which is why it belongs in the
+    # one function every command already calls rather than in each of them.
+    warn_on_build_skew(health if isinstance(health, dict) else {})
     return None
