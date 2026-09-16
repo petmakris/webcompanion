@@ -104,6 +104,74 @@ def test_the_zipapp_carries_a_build_stamp(tmp_path):
     assert stamped == build.build_id()
 
 
+def test_the_build_id_is_readable_from_inside_the_zipapp(tmp_path):
+    """The one that matters, and the one the archive-contents test missed.
+
+    The daemon does not read the zipapp, it RUNS from inside it, under the
+    system python rather than the one the tests use. `as_file()` on a
+    directory inside a zip yields an EMPTY temporary directory on Python
+    3.9 -- it materialises the directory, not its contents -- so a build id
+    computed by walking that path hashes nothing at all and every daemon
+    reports the digest of the empty string. Asserting only that the stamp is
+    present in the archive cannot see this; the id has to be read back by a
+    process actually running from it.
+    """
+    import subprocess
+    import sys
+
+    from webcompanion.commands import install_service as svc
+
+    pyz = svc.build_zipapp(tmp_path / "webcompanion.pyz")
+    with zipfile.ZipFile(pyz) as z:
+        stamped = z.read(f"webcompanion/{build.STAMP_NAME}").decode().strip()
+
+    out = subprocess.run(
+        [sys.executable, "-c",
+         "import sys; sys.path.insert(0, sys.argv[1]);"
+         "from webcompanion import build; print(build.build_id())",
+         str(pyz)],
+        capture_output=True, text=True, timeout=30,
+    )
+
+    assert out.returncode == 0, out.stderr
+    reported = out.stdout.strip()
+    assert reported == stamped
+
+    # An empty tree hashes to the digest of nothing. That value is what a
+    # directory-walking build_id() produces inside a zip, so it must never be
+    # what a daemon announces.
+    empty = tmp_path / "empty"
+    empty.mkdir()
+    assert reported != build.compute(empty)
+
+
+def test_a_stamped_copy_is_never_hashed(monkeypatch):
+    """The deterministic half of the test above, independent of interpreter.
+
+    The zipapp test only reproduces the failure on a python whose
+    `as_file()` cannot materialise a zip directory, which is the one the
+    service runs under and not necessarily the one the suite runs under.
+    This pins the invariant directly: when a stamp can be read, nothing
+    walks a directory -- so the bug cannot come back on any python.
+    """
+    def explode(_pkg_dir):
+        raise AssertionError("build_id() hashed a directory despite a readable stamp")
+
+    monkeypatch.setattr(build, "_stamp_from_resources", lambda: "deadbeefdeadbeef")
+    monkeypatch.setattr(build, "compute", explode)
+
+    assert build.build_id() == "deadbeefdeadbeef"
+
+
+def test_an_unstamped_source_install_still_reports_a_real_id(monkeypatch):
+    monkeypatch.setattr(build, "_stamp_from_resources", lambda: None)
+
+    got = build.build_id()
+
+    assert len(got) == 16
+    assert got != build.compute(Path(__file__).parent / "does-not-exist")
+
+
 def test_health_reports_the_build(wired):
     from webcompanion.commands._common import client_from_config
 

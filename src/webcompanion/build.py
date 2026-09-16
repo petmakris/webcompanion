@@ -30,7 +30,7 @@ unrelated edit and teach the user to ignore the one warning that matters.
 from __future__ import annotations
 
 import hashlib
-from importlib.resources import as_file, files
+from importlib.resources import files
 from pathlib import Path
 
 #: Written into the staged package by `build_zipapp`, read back at runtime.
@@ -86,14 +86,37 @@ def resolve(pkg_dir: Path) -> str:
     return read_stamp(pkg_dir) or compute(pkg_dir)
 
 
+def _stamp_from_resources() -> str | None:
+    """Read the stamp as a RESOURCE, never through a materialised directory.
+
+    This is the one call that has to keep working inside the zipapp, and the
+    obvious spelling does not. `as_file(files("webcompanion"))` on a package
+    inside a zip hands back an EMPTY temporary directory on the python the
+    service actually runs under (3.9): it materialises the directory, not its
+    contents. Walking that path finds no `.py` files, so the hash is the
+    digest of the empty string and every daemon announces the same id --
+    which looks exactly like "no skew" while hiding all of it.
+
+    Reading the single file as a resource avoids materialising anything.
+    """
+    try:
+        text = files("webcompanion").joinpath(STAMP_NAME).read_text()
+    except (FileNotFoundError, OSError, ValueError, TypeError):
+        return None
+    return text.strip() or None
+
+
 def build_id() -> str:
     """The build id of the running package, however it was installed.
 
-    Reached through `importlib.resources` rather than `__file__` so it keeps
-    working when the package is imported from inside the zipapp.
+    A frozen copy answers from its stamp and is never rehashed -- see
+    `resolve`. A source install has no stamp, and there `__file__` is a real
+    directory, so hashing it is both possible and correct.
     """
-    with as_file(files("webcompanion")) as pkg_dir:
-        return resolve(Path(pkg_dir))
+    stamp = _stamp_from_resources()
+    if stamp:
+        return stamp
+    return compute(Path(__file__).parent)
 
 
 def skew_message(daemon_build: str | None, local_build: str | None = None) -> str | None:
