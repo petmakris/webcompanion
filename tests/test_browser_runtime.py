@@ -157,3 +157,104 @@ def test_the_runtime_works_end_to_end_in_a_real_browser(live_daemon, tmp_path):
             assert v2["version"] == 1, "the untouched sibling must stay at v1"
         finally:
             browser.close()
+
+
+def _session_with_bundle(daemon, tmp_path):
+    """A session whose renderer is the stand-in bundle, with one item in it."""
+    bundle = tmp_path / "bundle"
+    bundle.mkdir(exist_ok=True)
+    (bundle / "app.js").write_text(BUNDLE_JS)
+    _, s = _call(daemon, "POST", "/api/sessions",
+                 {"kind": "annotate", "cwd": str(tmp_path), "title": "T"})
+    sid = s["sid"]
+    assert _call(daemon, "POST", f"/s/{sid}/api/assets",
+                 {"static_root": str(bundle), "entry": "app.js"})[0] == 200
+    assert _call(daemon, "PUT", f"/s/{sid}/items/a-1", {"t": "one"})[0] == 200
+    return sid
+
+
+def test_a_write_probe_that_never_answers_does_not_latch_the_page_read_only(
+        live_daemon, tmp_path):
+    """The probe is one request, and it used to get exactly one attempt.
+
+    Every open page holds one immortal SSE stream, and a browser allows six
+    connections per origin. Six open documents and the seventh request on
+    that origin queues behind streams that never end -- measured against a
+    real daemon: with six EventSources open /api/whoami stalls indefinitely,
+    and answers in 2ms the moment one closes. A dropped connection (the
+    daemon restarting, a laptop waking) fails the same probe a different
+    way.
+
+    Either way the old code decided `writable = false`, painted the body
+    read-only and never asked again. The document still rendered, so the
+    page looked fine -- it had just silently dropped every control on it,
+    with no way back but a reload at a luckier moment.
+
+    The stall is injected rather than staged with six real streams: a
+    saturated pool also starves the page's own assets, so the failure could
+    not be set up without stopping the page from loading at all.
+    """
+    from playwright.sync_api import TimeoutError as PWTimeout
+
+    sid = _session_with_bundle(live_daemon, tmp_path)
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page()
+        try:
+            stalled = {"on": True}
+
+            def probe(route):
+                # Returning without fulfilling leaves the request hanging,
+                # which is what a starved connection pool does to it.
+                if not stalled["on"]:
+                    route.continue_()
+
+            page.route("**/api/whoami", probe)
+
+            page.goto(f"{live_daemon.url}/s/{sid}/")
+            page.wait_for_function("() => !!window.WebCompanion")
+
+            # Precondition: with no answer there is no verdict to act on.
+            with pytest.raises(PWTimeout):
+                page.wait_for_function(
+                    "() => window.WebCompanion.writable === true", timeout=3000)
+
+            # A slot frees up. Nothing else about the page changes -- no
+            # reload, no navigation, no user action.
+            stalled["on"] = False
+
+            page.wait_for_function(
+                "() => window.WebCompanion.writable === true", timeout=20000)
+            assert page.evaluate(
+                "() => document.body.classList.contains('read-only')") is False, \
+                "the page recovered write access but still renders as read-only"
+        finally:
+            browser.close()
+
+
+def test_a_refused_probe_still_paints_the_page_read_only(live_daemon, tmp_path):
+    """The other half of the contract, so retrying cannot swallow a real
+    refusal: a probe the daemon ANSWERS with "not writable" is a verdict,
+    not a glitch. It is painted, and it stands."""
+    sid = _session_with_bundle(live_daemon, tmp_path)
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page()
+        try:
+            page.route("**/api/whoami", lambda route: route.fulfill(
+                status=200, content_type="application/json",
+                body=json.dumps({"writable": False})))
+
+            page.goto(f"{live_daemon.url}/s/{sid}/")
+            page.wait_for_function(
+                "() => document.body.classList.contains('read-only')",
+                timeout=10000)
+            page.wait_for_timeout(2000)
+            assert page.evaluate("() => window.WebCompanion.writable") is False
+            assert page.evaluate(
+                "() => document.body.classList.contains('read-only')") is True, \
+                "a refusal was retried away"
+        finally:
+            browser.close()

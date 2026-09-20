@@ -102,14 +102,55 @@
   // upgrade on purpose, because reminting it would invalidate the IDE
   // plugin's saved credential mid-session. What can go stale is a token
   // this tab kept from a machine whose config was replaced.
-  async function resolveWritable() {
+  //
+  // "Could not ask" is not "was refused", and telling them apart is the
+  // whole reason this retries. Every open page holds one immortal SSE
+  // stream and a browser allows six connections per origin, so the seventh
+  // request on that origin queues behind streams that never end -- measured
+  // against a live daemon: with six EventSources open this probe stalls
+  // indefinitely, and answers in 2ms the moment one closes. A restarting
+  // daemon or a waking laptop drops it a different way. None of that says
+  // anything about what this client is allowed to do.
+  //
+  // Answering any of it with "read-only" renders the document with every
+  // control silently removed. The page looks fine, nothing on it works, and
+  // there is no way back but a reload at a luckier moment -- so only an
+  // answer from the daemon counts as a verdict, and the rest is asked again.
+  const PROBE_TIMEOUT_MS = 4000;
+  const PROBE_RETRY_MS = [1000, 2000, 5000, 10000];
+
+  // true or false when the daemon answered, null when it could not be asked.
+  // A 2xx carries the verdict; 401/403/404 are the daemon declining or not
+  // offering the route at all, which is equally an answer. Everything else
+  // (a gateway's 5xx, an abort, a dropped socket) is this client failing to
+  // reach it, which is not.
+  async function probeWritable() {
+    const ctl = typeof AbortController === "function" ? new AbortController() : null;
+    const timer = ctl ? setTimeout(() => ctl.abort(), PROBE_TIMEOUT_MS) : null;
     try {
-      const r = await fetch("/api/whoami", { headers: headers() });
-      writable = r.ok ? !!(await r.json()).writable : false;
+      const opts = { headers: headers() };
+      if (ctl) opts.signal = ctl.signal;
+      const r = await fetch("/api/whoami", opts);
+      if (r.ok) return !!(await r.json()).writable;
+      return (r.status === 401 || r.status === 403 || r.status === 404) ? false : null;
     } catch (_) {
-      writable = false;
+      return null;
+    } finally {
+      if (timer) clearTimeout(timer);
     }
-    document.body.classList.toggle("read-only", !writable);
+  }
+
+  async function resolveWritable() {
+    for (let attempt = 0; !ended; attempt++) {
+      const verdict = await probeWritable();
+      if (verdict !== null) {
+        writable = verdict;
+        document.body.classList.toggle("read-only", !writable);
+        return writable;
+      }
+      const wait = PROBE_RETRY_MS[Math.min(attempt, PROBE_RETRY_MS.length - 1)];
+      await new Promise((r) => setTimeout(r, wait));
+    }
     return writable;
   }
 
@@ -360,9 +401,11 @@
     init({ onDelta: handler, root } = {}) {
       onDelta = handler || (() => {});
       bindSelection(root);
-      // Paint read-only before the first fetch so a reader never sees
-      // controls appear and then vanish. Live updates do not wait on it --
-      // reading is what a shared link is for.
+      // Deliberately not awaited, and it no longer settles in one attempt:
+      // it keeps asking until the daemon answers. Live updates must not
+      // wait behind that -- reading is what a shared link is for -- and the
+      // stream is started first on purpose, because `writable` gates only
+      // the controls and starts out false.
       resolveWritable();
       startStream();
     },
