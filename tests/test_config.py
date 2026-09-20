@@ -18,13 +18,15 @@ def test_defaults_when_no_file(tmp_path):
     assert cfg.idle_expiry_hours == cfgmod.DEFAULT_IDLE_EXPIRY_HOURS
     assert cfg.workspace_root is None
     assert cfg.token == ""
+    assert cfg.tailscale_owner_login is None
 
 
 def test_write_then_load_roundtrips(tmp_path):
     p = tmp_path / "config.json"
     cfg = cfgmod.Config(port=3999, token="abc", bind="127.0.0.1",
                         retention_days=30, idle_expiry_hours=6,
-                        workspace_root=tmp_path / "ws")
+                        workspace_root=tmp_path / "ws",
+                        tailscale_owner_login="me@example.com")
     cfgmod.write(cfg, p)
     back = cfgmod.load(p)
     assert back.port == 3999
@@ -32,6 +34,19 @@ def test_write_then_load_roundtrips(tmp_path):
     assert back.retention_days == 30
     assert back.idle_expiry_hours == 6
     assert back.workspace_root == tmp_path / "ws"
+    assert back.tailscale_owner_login == "me@example.com"
+
+
+def test_tailscale_owner_login_defaults_to_none_for_a_config_file_written_before_the_field_existed(tmp_path):
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"port": 3080, "token": "t", "bind": "127.0.0.1"}))
+    assert cfgmod.load(p).tailscale_owner_login is None
+
+
+def test_a_blank_tailscale_owner_login_is_treated_as_unset(tmp_path):
+    p = tmp_path / "config.json"
+    p.write_text(json.dumps({"tailscale_owner_login": "   "}))
+    assert cfgmod.load(p).tailscale_owner_login is None
 
 
 def test_idle_expiry_hours_defaults_for_a_config_file_written_before_the_field_existed(tmp_path):

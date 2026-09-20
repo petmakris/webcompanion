@@ -4,6 +4,7 @@
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>webcompanion</title>
+<link rel="icon" type="image/svg+xml" href="/_wc/favicon.svg">
 <style>
   :root {
     --bg: #f6f7f9; --card: #fff; --line: #e2e5ea; --ink: #1b1e26;
@@ -82,6 +83,32 @@ const CONTRACT = "X-WebCompanion-Contract";
 const view = document.getElementById("view");
 const sub = document.getElementById("sub");
 let rows = [];
+
+// ── Owner token ────────────────────────────────────────────────────────
+// /api/sessions is owner-gated even for reads -- it names every workspace
+// on the daemon, not just one the caller already knows about. Loopback is
+// the owner by construction; anyone else needs this token, exactly as a
+// single session page does (see core.js, which this mirrors). It arrives
+// in the URL fragment, which browsers never send to the server and never
+// log, so the link can be pasted into a terminal or a note without the
+// credential leaking through the request path. Held in sessionStorage,
+// not localStorage: a shared or borrowed device forgets it when the tab
+// closes. Captured and stripped before route() ever reads location.hash,
+// so a "#k=..." link never gets misread as a kind name.
+const TOKEN_HEADER = "X-WebCompanion-Token";
+const TOKEN_KEY = "webcompanion.token." + window.location.host;
+const token = (() => {
+  const m = /(?:^|[#&])k=([^&]+)/.exec(window.location.hash || "");
+  if (m) {
+    const t = decodeURIComponent(m[1]);
+    try { sessionStorage.setItem(TOKEN_KEY, t); } catch (_) {}
+    try {
+      history.replaceState(null, "", window.location.pathname + window.location.search);
+    } catch (_) {}
+    return t;
+  }
+  try { return sessionStorage.getItem(TOKEN_KEY) || ""; } catch (_) { return ""; }
+})();
 
 function el(tag, cls, text) {
   const e = document.createElement(tag);
@@ -192,7 +219,9 @@ function route() {
 
 async function refresh() {
   try {
-    const res = await fetch("/api/sessions?scope=all", { headers: { [CONTRACT]: "1" } });
+    const headers = { [CONTRACT]: "1" };
+    if (token) headers[TOKEN_HEADER] = token;
+    const res = await fetch("/api/sessions?scope=all", { headers });
     if (res.status === 403) {
       sub.textContent = "this listing is for the owner of this daemon";
       return;

@@ -393,7 +393,7 @@ def _make_handler(daemon: Daemon):
             return parsed if isinstance(parsed, dict) else {}
 
         def _require_owner(self) -> bool:
-            if gate.is_owner(self, daemon.cfg.token):
+            if gate.is_owner(self, daemon.cfg.token, daemon.cfg.tailscale_owner_login):
                 return True
             self._text(403, "forbidden")
             return False
@@ -403,6 +403,22 @@ def _make_handler(daemon: Daemon):
             if not ok:
                 self._text(426, message)
             return ok
+
+        def _public_url(self) -> str:
+            """The base URL a client can actually use to reach this daemon back.
+
+            `daemon.url` is built from the bind address, which is fine while
+            that address is loopback but becomes the literal, unroutable string
+            "0.0.0.0" once `bind` is opened up so another machine can reach the
+            daemon (e.g. over Tailscale) -- every session's own `url` field
+            would then point nowhere, which is exactly the link a browser or
+            the CLI hands back to a human. The Host header a client sent is,
+            by construction, an address that already worked for THIS request,
+            so echoing it back is correct regardless of what the daemon is
+            bound to or which interface the request arrived on.
+            """
+            host = self.headers.get("Host")
+            return f"http://{host}" if host else daemon.url
 
         def _session(self, sid: str):
             """Resolve a sid or slug, honouring `?kind=` when given.
@@ -447,7 +463,7 @@ def _make_handler(daemon: Daemon):
                 "cwd": meta.get("cwd", ""),
                 "title": meta.get("title", ""),
                 "state": state,
-                "url": f"{daemon.url}/s/{sid}/",
+                "url": f"{self._public_url()}/s/{sid}/",
             }
 
         # ── dispatch ────────────────────────────────────────────────────
@@ -466,6 +482,8 @@ def _make_handler(daemon: Daemon):
                 return self._list_sessions(parse_qs(parsed.query))
             if path == "/_wc/core.js":
                 return self._core_js()
+            if path == "/_wc/favicon.svg":
+                return self._favicon()
             m = _SID_POLL_RE.match(path)
             if m:
                 return self._poll(m.group(1))
@@ -618,7 +636,8 @@ def _make_handler(daemon: Daemon):
             })
 
         def _whoami(self) -> None:
-            self._json(200, {"writable": gate.is_owner(self, daemon.cfg.token)})
+            writable = gate.is_owner(self, daemon.cfg.token, daemon.cfg.tailscale_owner_login)
+            self._json(200, {"writable": writable})
 
         def _list_sessions(self, query: dict) -> None:
             scope = (query.get("scope") or [""])[0]
@@ -789,7 +808,7 @@ def _make_handler(daemon: Daemon):
             daemon.registry.persist()
             self._json(201, {
                 "sid": sid, "slug": slug, "kind": kind,
-                "url": f"{daemon.url}/s/{sid}/",
+                "url": f"{self._public_url()}/s/{sid}/",
                 "token": daemon.cfg.token,
             })
 
@@ -975,6 +994,10 @@ def _make_handler(daemon: Daemon):
 
         def _core_js(self) -> None:
             with _static_file("core.js") as p:
+                self._serve_file(p)
+
+        def _favicon(self) -> None:
+            with _static_file("favicon.svg") as p:
                 self._serve_file(p)
 
         def _index(self) -> None:

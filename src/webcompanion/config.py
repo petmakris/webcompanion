@@ -42,6 +42,11 @@ class Config:
     retention_days: int | None = None
     idle_expiry_hours: int | None = DEFAULT_IDLE_EXPIRY_HOURS
     workspace_root: Path | None = None
+    # A Tailscale login (e.g. "you@example.com") that a caller may prove
+    # instead of the token -- see gate.is_owner. None (the default) keeps
+    # this path off: no `tailscale whois` shellout on the request path
+    # unless the owner has actually configured a login to trust.
+    tailscale_owner_login: str | None = None
 
 
 def config_path() -> Path:
@@ -100,6 +105,9 @@ def load(path: Path | None = None) -> Config:
         if candidate.is_absolute():
             ws = candidate
 
+    login_raw = raw.get("tailscale_owner_login")
+    tailscale_owner_login = login_raw.strip() if isinstance(login_raw, str) and login_raw.strip() else None
+
     return Config(
         port=_int("port", DEFAULT_PORT),
         token=_str("token", ""),
@@ -107,6 +115,7 @@ def load(path: Path | None = None) -> Config:
         retention_days=_int("retention_days", None) if raw.get("retention_days") is not None else None,
         idle_expiry_hours=_int_or_none("idle_expiry_hours", DEFAULT_IDLE_EXPIRY_HOURS),
         workspace_root=ws,
+        tailscale_owner_login=tailscale_owner_login,
     )
 
 
@@ -125,6 +134,7 @@ def write(cfg: Config, path: Path | None = None) -> None:
         "retention_days": cfg.retention_days,
         "idle_expiry_hours": cfg.idle_expiry_hours,
         "workspace_root": str(cfg.workspace_root) if cfg.workspace_root else None,
+        "tailscale_owner_login": cfg.tailscale_owner_login,
     }
     fd, tmp = tempfile.mkstemp(dir=str(path.parent), prefix="config.", suffix=".tmp")
     try:

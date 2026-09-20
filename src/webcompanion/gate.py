@@ -5,7 +5,13 @@ This is the only module that answers either question. Everything else asks it.
 from __future__ import annotations
 
 import ipaddress
+import json
+import os
 import secrets
+import shutil
+import subprocess
+import threading
+import time
 from urllib.parse import urlsplit
 
 from webcompanion import CONTRACT
@@ -13,12 +19,125 @@ from webcompanion import CONTRACT
 WRITE_TOKEN_HEADER = "X-WebCompanion-Token"
 CONTRACT_HEADER = "X-WebCompanion-Contract"
 
+# Tailscale's fixed CGNAT range (100.64.0.0/10) and its per-tailnet IPv6 ULA
+# prefix (fd7a:115c:a1e0::/48 -- constant across every tailnet, not just this
+# one). Used only to decide whether an address is worth a `tailscale whois`
+# call at all; being in range is not itself a trust decision.
+_TAILSCALE_V4 = ipaddress.ip_network("100.64.0.0/10")
+_TAILSCALE_V6 = ipaddress.ip_network("fd7a:115c:a1e0::/48")
+
+_WHOIS_TIMEOUT = 1.5
+_WHOIS_CACHE_SECONDS = 30.0
+_whois_cache: dict[str, tuple[float, str | None]] = {}
+_whois_cache_lock = threading.Lock()
+
+# Where Tailscale actually installs, checked when `PATH` doesn't have it. A
+# launchd LaunchAgent's default environment is `PATH=/usr/bin:/bin:/usr/sbin:
+# /sbin` (verified against this daemon's own service) -- it never sees an
+# interactive shell's PATH, so a bare `["tailscale", ...]` fails with
+# FileNotFoundError every time the daemon actually runs it, silently, since
+# _tailscale_login's blanket `except` turns that into an ordinary refusal
+# with no other sign anything is wrong.
+#
+# Deliberately EXCLUDES the macOS App Store build's own binary
+# (/Applications/Tailscale.app/Contents/MacOS/Tailscale): verified by direct
+# invocation that it aborts ("The Tailscale GUI failed to start ... CLIError
+# error 3") unless argv[0] itself looks like a path inside the bundle -- a
+# wrapper script can `exec` it with the right argv[0], but a second,
+# different absolute path to the same binary here would not, so listing it
+# would silently prefer a candidate that never works.
+_TAILSCALE_BIN_CANDIDATES = (
+    os.path.expanduser("~/.local/bin/tailscale"),
+    "/usr/local/bin/tailscale",
+    "/opt/homebrew/bin/tailscale",
+    "/usr/bin/tailscale",
+    "/usr/sbin/tailscale",
+)
+_tailscale_bin_lock = threading.Lock()
+_tailscale_bin_resolved = False
+_tailscale_bin_path: str | None = None
+
+
+def _tailscale_bin() -> str | None:
+    """The `tailscale` binary's absolute path, resolved once and cached.
+
+    Tries `PATH` first (respects an environment where it IS set up), then
+    falls back to the handful of places the macOS package, Homebrew, and a
+    user-local install actually put it. None means none of those panned out.
+    """
+    global _tailscale_bin_resolved, _tailscale_bin_path
+    with _tailscale_bin_lock:
+        if _tailscale_bin_resolved:
+            return _tailscale_bin_path
+        found = shutil.which("tailscale")
+        if not found:
+            for candidate in _TAILSCALE_BIN_CANDIDATES:
+                if os.access(candidate, os.X_OK):
+                    found = candidate
+                    break
+        _tailscale_bin_path = found
+        _tailscale_bin_resolved = True
+        return found
+
 
 def is_loopback(addr: str) -> bool:
     try:
         return ipaddress.ip_address(addr.split("%", 1)[0]).is_loopback
     except ValueError:
         return False
+
+
+def _is_tailscale_addr(addr: str) -> bool:
+    try:
+        ip = ipaddress.ip_address(addr.split("%", 1)[0])
+    except ValueError:
+        return False
+    return ip in _TAILSCALE_V4 or ip in _TAILSCALE_V6
+
+
+def _tailscale_login(addr: str, run=subprocess.run, tailscale_bin: str | None = "") -> str | None:
+    """The tailnet login that owns `addr`, or None if it isn't one of ours.
+
+    Shells out to `tailscale whois` rather than talking to tailscaled's
+    LocalAPI directly -- the CLI is the documented, stable surface for this
+    question, and it is cheap enough next to a write request that a short
+    per-address cache is the only optimisation this needs. A missing/hung
+    `tailscale` binary, a non-tailnet address, or any parse failure all fail
+    CLOSED (None) rather than raise -- this sits on the request path that
+    decides who may write, and a bug here must never turn into a 500 or a
+    hang, only a refusal.
+
+    `tailscale_bin=""` (the default) means "resolve it via `_tailscale_bin()`"
+    -- a caller can pass an explicit path (or None) to bypass that lookup,
+    which is what the tests do so they exercise the run/parse logic without
+    depending on where THIS machine happens to keep the binary.
+    """
+    now = time.monotonic()
+    with _whois_cache_lock:
+        cached = _whois_cache.get(addr)
+        if cached is not None and now - cached[0] < _WHOIS_CACHE_SECONDS:
+            return cached[1]
+    login: str | None = None
+    binary = _tailscale_bin() if tailscale_bin == "" else tailscale_bin
+    try:
+        if binary is None:
+            raise FileNotFoundError("tailscale binary not found")
+        out = run([binary, "whois", "--json", addr],
+                  capture_output=True, text=True, timeout=_WHOIS_TIMEOUT, check=True)
+        info = json.loads(out.stdout)
+        # `MachineAuthorized` only ever appears on the daemon's OWN node
+        # (verified against a live peer: a phone actually connected over the
+        # tailnet has no such key in its `whois` output at all). Reaching us
+        # as a routable peer already proves the tailnet authorized it, so an
+        # explicit `false` is the only signal worth refusing on; absent means
+        # trust the login name.
+        if info.get("Node", {}).get("MachineAuthorized") is not False:
+            login = info.get("UserProfile", {}).get("LoginName") or None
+    except Exception:
+        login = None
+    with _whois_cache_lock:
+        _whois_cache[addr] = (now, login)
+    return login
 
 
 def _header(handler, name: str) -> str:
@@ -76,13 +195,17 @@ def _host_hostname(host: str) -> str | object | None:
     return _hostname(f"//{host}") if host else None
 
 
-def is_owner(handler, token: str) -> bool:
-    """Two ways to be the owner, and no third.
+def is_owner(handler, token: str, owner_login: str | None = None) -> bool:
+    """Three ways to be the owner, and no fourth.
 
     Loopback is the owner by construction — nobody else can reach it, so the
     CLI and the browser on this machine both pass without configuration.
-    Everyone else needs the capability token, handed out only through the
-    owner URL.
+    Everyone else needs either the capability token (handed out only through
+    the owner URL) or, when `owner_login` is configured, a Tailscale identity
+    that resolves to it: a caller reaching us from an authorized node on our
+    own tailnet, logged in as us. The second path is opt-in (`owner_login`
+    defaults to None, i.e. off) because it shells out per uncached address and
+    depends on the `tailscale` binary being present and tailscaled running.
 
     But loopback alone is not enough, because JavaScript on ANY website runs
     from loopback: a page you merely visit could otherwise reach this daemon
@@ -109,10 +232,15 @@ def is_owner(handler, token: str) -> bool:
     if is_loopback(handler.client_address[0]):
         return True
 
+    addr = handler.client_address[0]
     presented = _header(handler, WRITE_TOKEN_HEADER)
-    if not presented or not token:
-        return False
-    return secrets.compare_digest(presented, token)
+    if presented and token and secrets.compare_digest(presented, token):
+        return True
+
+    if owner_login and _is_tailscale_addr(addr):
+        return _tailscale_login(addr) == owner_login
+
+    return False
 
 
 def check_contract(handler) -> tuple[bool, str]:

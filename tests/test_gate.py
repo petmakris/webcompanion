@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import inspect
+import json
+import subprocess
 
 import pytest
 
@@ -156,6 +158,157 @@ def test_a_junk_contract_header_is_a_mismatch_not_a_crash():
     h = FakeHandler()
     h.headers[gate.CONTRACT_HEADER] = "banana"
     assert gate.check_contract(h)[0] is False
+
+
+def test_tailscale_login_is_off_by_default_even_from_a_tailscale_address():
+    h = FakeHandler("100.64.1.2")
+    assert gate.is_owner(h, token="secret") is False
+
+
+def test_a_matching_tailscale_identity_is_allowed(monkeypatch):
+    monkeypatch.setattr(gate, "_tailscale_login", lambda addr: "me@example.com")
+    h = FakeHandler("100.64.1.2")
+    assert gate.is_owner(h, token="secret", owner_login="me@example.com") is True
+
+
+def test_a_different_tailscale_identity_is_refused(monkeypatch):
+    monkeypatch.setattr(gate, "_tailscale_login", lambda addr: "someone-else@example.com")
+    h = FakeHandler("100.64.1.2")
+    assert gate.is_owner(h, token="secret", owner_login="me@example.com") is False
+
+
+def test_an_unresolvable_tailscale_address_is_refused(monkeypatch):
+    # e.g. `tailscale` binary missing, tailscaled down, or the address turned
+    # out not to be a peer -- _tailscale_login fails closed with None.
+    monkeypatch.setattr(gate, "_tailscale_login", lambda addr: None)
+    h = FakeHandler("100.64.1.2")
+    assert gate.is_owner(h, token="secret", owner_login="me@example.com") is False
+
+
+def test_owner_login_configured_but_address_is_not_tailscale_never_shells_out(monkeypatch):
+    def _boom(addr):
+        raise AssertionError("must not be called for a non-tailscale address")
+    monkeypatch.setattr(gate, "_tailscale_login", _boom)
+    h = FakeHandler("10.0.0.5")
+    assert gate.is_owner(h, token="secret", owner_login="me@example.com") is False
+
+
+def test_the_token_path_still_wins_when_both_are_configured(monkeypatch):
+    def _boom(addr):
+        raise AssertionError("token already matched; must not shell out")
+    monkeypatch.setattr(gate, "_tailscale_login", _boom)
+    h = FakeHandler("100.64.1.2")
+    h.headers[gate.WRITE_TOKEN_HEADER] = "secret"
+    assert gate.is_owner(h, token="secret", owner_login="me@example.com") is True
+
+
+def test_is_tailscale_addr_recognises_the_cgnat_range_and_the_ula_prefix():
+    assert gate._is_tailscale_addr("100.64.0.1") is True
+    assert gate._is_tailscale_addr("100.127.255.254") is True
+    assert gate._is_tailscale_addr("fd7a:115c:a1e0::1") is True
+    assert gate._is_tailscale_addr("10.0.0.5") is False
+    assert gate._is_tailscale_addr("8.8.8.8") is False
+    assert gate._is_tailscale_addr("not-an-ip") is False
+
+
+def test_tailscale_login_parses_an_authorized_node_and_caches_the_result():
+    calls = []
+
+    class _FakeCompleted:
+        stdout = json.dumps({
+            "Node": {"MachineAuthorized": True},
+            "UserProfile": {"LoginName": "me@example.com"},
+        })
+
+    def _fake_run(cmd, **kwargs):
+        calls.append(cmd)
+        return _FakeCompleted()
+
+    gate._whois_cache.clear()
+    assert gate._tailscale_login("100.99.1.1", run=_fake_run, tailscale_bin="/x/tailscale") == "me@example.com"
+    # Second call within the cache window must not shell out again.
+    assert gate._tailscale_login("100.99.1.1", run=_fake_run, tailscale_bin="/x/tailscale") == "me@example.com"
+    assert len(calls) == 1
+    assert calls[0][0] == "/x/tailscale"
+
+
+def test_tailscale_login_trusts_a_peer_whose_whois_omits_machine_authorized():
+    # The real shape for a peer that isn't the daemon's own node -- verified
+    # against a live device on the tailnet, which carries no such key at all.
+    class _FakeCompleted:
+        stdout = json.dumps({
+            "Node": {"HostName": "phone"},
+            "UserProfile": {"LoginName": "me@example.com"},
+        })
+
+    gate._whois_cache.clear()
+    run = lambda cmd, **kw: _FakeCompleted()
+    assert gate._tailscale_login("100.99.1.4", run=run, tailscale_bin="/x/tailscale") == "me@example.com"
+
+
+def test_tailscale_login_refuses_an_unauthorized_node():
+    class _FakeCompleted:
+        stdout = json.dumps({
+            "Node": {"MachineAuthorized": False},
+            "UserProfile": {"LoginName": "me@example.com"},
+        })
+
+    gate._whois_cache.clear()
+    run = lambda cmd, **kw: _FakeCompleted()
+    assert gate._tailscale_login("100.99.1.2", run=run, tailscale_bin="/x/tailscale") is None
+
+
+def test_tailscale_login_fails_closed_on_any_error():
+    def _raise(cmd, **kwargs):
+        raise subprocess.TimeoutExpired(cmd, 1.5)
+
+    gate._whois_cache.clear()
+    assert gate._tailscale_login("100.99.1.3", run=_raise, tailscale_bin="/x/tailscale") is None
+
+
+def test_tailscale_login_fails_closed_when_the_binary_cannot_be_found_anywhere():
+    # The regression this whole module needs to never repeat: a launchd
+    # LaunchAgent's PATH is `/usr/bin:/bin:/usr/sbin:/sbin` (verified against
+    # this daemon's own service), which does not contain `tailscale` on this
+    # machine. Passing tailscale_bin=None simulates _tailscale_bin() coming
+    # up empty; this must refuse cleanly, not raise.
+    def _boom(cmd, **kwargs):
+        raise AssertionError("must not attempt to run a binary that was never found")
+
+    gate._whois_cache.clear()
+    assert gate._tailscale_login("100.99.1.5", run=_boom, tailscale_bin=None) is None
+
+
+def test_tailscale_bin_prefers_path_when_it_resolves(monkeypatch):
+    monkeypatch.setattr(gate.shutil, "which", lambda name: "/from/path/tailscale")
+    gate._tailscale_bin_resolved = False
+    try:
+        assert gate._tailscale_bin() == "/from/path/tailscale"
+    finally:
+        gate._tailscale_bin_resolved = False
+
+
+def test_tailscale_bin_falls_back_to_a_known_install_location(monkeypatch):
+    # This is exactly the launchd case: PATH lookup fails, but the binary is
+    # sitting in one of the well-known places Tailscale actually installs to.
+    monkeypatch.setattr(gate.shutil, "which", lambda name: None)
+    monkeypatch.setattr(gate.os, "access",
+                         lambda p, mode: p == "/opt/homebrew/bin/tailscale")
+    gate._tailscale_bin_resolved = False
+    try:
+        assert gate._tailscale_bin() == "/opt/homebrew/bin/tailscale"
+    finally:
+        gate._tailscale_bin_resolved = False
+
+
+def test_tailscale_bin_is_none_when_nothing_resolves(monkeypatch):
+    monkeypatch.setattr(gate.shutil, "which", lambda name: None)
+    monkeypatch.setattr(gate.os, "access", lambda p, mode: False)
+    gate._tailscale_bin_resolved = False
+    try:
+        assert gate._tailscale_bin() is None
+    finally:
+        gate._tailscale_bin_resolved = False
 
 
 def test_token_comparison_uses_compare_digest_not_equality():
