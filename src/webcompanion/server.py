@@ -824,12 +824,16 @@ def _make_handler(daemon: Daemon):
             self._json(200, items.snapshot(dirs["items_dir"]))
 
         def _get_item(self, sid: str, dirs: dict, anchor: str) -> None:
-            body = items.load_one(dirs["items_dir"], anchor)
-            if body is None:
+            # Body and version from ONE read. Reading the body and then
+            # deriving versions in a second pass let a write land between the
+            # two, serving v2 with v1's text; a page that trusts the version
+            # would then never fetch the real v2.
+            entry = items.snapshot(dirs["items_dir"]).get(anchor)
+            if entry is None or entry["body"] is None:
                 self._text(404, "no such item")
                 return
-            versions = items.versions_of(dirs["items_dir"])
-            out = {"body": body, "version": versions.get(anchor, 1)}
+            body = entry["body"]
+            out = {"body": body, "version": entry["version"]}
             # A row with no _cwd cannot resolve code anchors -- and reaching
             # for the key anyway raised KeyError inside the handler, i.e. a
             # 500 with a traceback for what is a malformed session row.

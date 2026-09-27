@@ -153,3 +153,25 @@ def test_poll_reports_acked_event_ids(call, daemon):
     (consumed / "evt-3.json").write_text("{}")
     _, poll = call("GET", f"/s/{s['sid']}/poll")
     assert poll["acked"] == ["evt-1", "evt-2"]
+
+
+def test_an_item_read_never_pairs_a_new_version_with_an_old_body(call, daemon, monkeypatch):
+    """GET /items/<anchor> once read the body, then derived versions in a
+    second read. A write landing between the two served v2 with v1's text,
+    and a page that trusts the version never re-fetched the real v2."""
+    s = _session(call)
+    sid = s["sid"]
+    call("PUT", f"/s/{sid}/items/b-1", {"t": "old"})
+    # Versions are derived on read; this read is what records "old" as v1.
+    assert call("GET", f"/s/{sid}/items/b-1")[1]["version"] == 1
+    dirs = daemon.registry.lookup(daemon.registry.resolve(sid))
+    real_load_one = items.load_one
+
+    def load_one_then_a_write_lands(items_dir, anchor):
+        body = real_load_one(items_dir, anchor)
+        items.put(Path(dirs["items_dir"]), "b-1", {"t": "new"})
+        return body
+
+    monkeypatch.setattr(items, "load_one", load_one_then_a_write_lands)
+    _, got = call("GET", f"/s/{sid}/items/b-1")
+    assert (got["body"]["t"], got["version"]) in {("old", 1), ("new", 2)}, got
