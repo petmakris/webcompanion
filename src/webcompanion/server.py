@@ -1078,6 +1078,7 @@ def _make_handler(daemon: Daemon):
                 "watcher_seen_at": _watcher_seen_at(state_dir),
                 "items": items.versions_of(dirs["items_dir"]),
                 "threads": threads.list_versions(dirs["threads_dir"]),
+                "acked": sorted(stream.acked_event_ids(Path(dirs["consumed_dir"]))),
             })
 
         def _stream(self, sid: str) -> None:

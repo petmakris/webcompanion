@@ -186,6 +186,10 @@
   // change that arrives while switching transports is a real change.
   let firstSnapshotSeen = false;
   const pollIntervalMs = 1000;
+  // Acks this page has already reported, from either transport, so a switch
+  // between them never reports one twice. The first poll seeds it silently:
+  // an ack that predates the page is history, not news.
+  const seenAcks = new Set();
 
   function frame(ev) {
     try { return JSON.parse(ev.data); } catch (_) { return {}; }
@@ -223,7 +227,8 @@
     // no version and is otherwise indistinguishable from "still working".
     es.addEventListener("event-acked", (ev) => {
       const d = frame(ev);
-      if (!d) return;
+      if (!d.event_id || seenAcks.has(d.event_id)) return;
+      seenAcks.add(d.event_id);
       onDelta({ kind: "event-acked", anchor: null, version: 0, initial: false,
                 event_id: d.event_id });
     });
@@ -296,6 +301,14 @@
         if (lastVersions[key] !== threads[anchor]) {
           lastVersions[key] = threads[anchor];
           onDelta({ kind: "thread", anchor, version: threads[anchor], initial: isInitial });
+        }
+      }
+      for (const eventId of data.acked || []) {
+        if (seenAcks.has(eventId)) continue;
+        seenAcks.add(eventId);
+        if (!isInitial) {
+          onDelta({ kind: "event-acked", anchor: null, version: 0, initial: false,
+                    event_id: eventId });
         }
       }
     } catch (e) {

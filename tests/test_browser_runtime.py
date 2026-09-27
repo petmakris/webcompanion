@@ -290,3 +290,32 @@ def test_an_ack_reaches_the_page_as_an_event_acked_delta(live_daemon, tmp_path):
             assert not errors, errors
         finally:
             browser.close()
+
+
+def test_an_ack_reaches_a_page_on_the_polling_fallback(live_daemon, tmp_path):
+    """Same signal, other transport: with the stream refused, the page polls,
+    and an ack must still arrive as an `event-acked` delta, once."""
+    sid = _session_with_bundle(live_daemon, tmp_path)
+    dirs = live_daemon.registry.lookup(live_daemon.registry.resolve(sid))
+    consumed = Path(dirs["consumed_dir"])
+    consumed.mkdir(parents=True, exist_ok=True)
+    (consumed / "evt-old.ack").write_text("")
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page()
+        page.route("**/stream", lambda route: route.abort())
+        try:
+            page.goto(f"{live_daemon.url}/s/{sid}/")
+            page.wait_for_function("() => window.__deltas.length >= 1", timeout=8000)
+            (consumed / "evt-new.ack").write_text("")
+            page.wait_for_function(
+                "() => window.__deltas.some(d => d.kind === 'event-acked')",
+                timeout=8000)
+            page.wait_for_timeout(2500)
+            ids = page.evaluate("() => window.__deltas"
+                                ".filter(d => d.kind === 'event-acked').map(d => d.event_id)")
+            # An ack that predates the page is history, not news.
+            assert ids == ["evt-new"], ids
+        finally:
+            browser.close()

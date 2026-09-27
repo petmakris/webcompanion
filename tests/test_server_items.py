@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+from pathlib import Path
+
 from webcompanion import items
 
 
@@ -134,3 +136,20 @@ def test_open_in_editor_refuses_a_path_outside_every_session(tmp_path, call):
     status, _ = call("POST", "/api/open",
                      {"file": str(tmp_path / "elsewhere.txt"), "line": 1})
     assert status == 403
+
+
+def test_poll_reports_acked_event_ids(call, daemon):
+    """The stream's `event-acked` frame is the only signal for an answer that
+    changed nothing. A page that fell back to polling needs the same fact, or
+    it stays locked after the answer."""
+    s = _session(call)
+    _, poll = call("GET", f"/s/{s['sid']}/poll")
+    assert poll["acked"] == []
+    dirs = daemon.registry.lookup(daemon.registry.resolve(s["sid"]))
+    consumed = Path(dirs["consumed_dir"])
+    consumed.mkdir(parents=True, exist_ok=True)
+    (consumed / "evt-2.ack").write_text("")
+    (consumed / "evt-1.ack").write_text("")
+    (consumed / "evt-3.json").write_text("{}")
+    _, poll = call("GET", f"/s/{s['sid']}/poll")
+    assert poll["acked"] == ["evt-1", "evt-2"]

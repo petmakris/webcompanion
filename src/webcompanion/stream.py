@@ -41,6 +41,16 @@ _open_lock = threading.Lock()
 ACK_SUFFIX = ".ack"
 
 
+def acked_event_ids(consumed_dir: Path) -> set:
+    """Ids of the session's events that have been answered. Shared with
+    /poll, so a page on the polling fallback learns of an ack too."""
+    try:
+        return {e.name[:-len(ACK_SUFFIX)] for e in os.scandir(consumed_dir)
+                if e.name.endswith(ACK_SUFFIX)}
+    except (FileNotFoundError, NotADirectoryError, PermissionError):
+        return set()
+
+
 def open_stream_count() -> int:
     with _open_lock:
         return _open
@@ -139,19 +149,12 @@ def serve(handler, sid: str, dirs: dict, *, registry, is_terminal) -> None:
         # `keep` marks produces no such move, and the page stays locked.
         consumed_dir = Path(dirs["consumed_dir"])
 
-        def acked_event_ids() -> set:
-            try:
-                return {e.name[:-4] for e in os.scandir(consumed_dir)
-                        if e.name.endswith(ACK_SUFFIX)}
-            except (FileNotFoundError, NotADirectoryError, PermissionError):
-                return set()
-
         # Taken BEFORE the connected frame: a client that has seen `connected`
         # must be guaranteed that any later ack reaches it. Snapshotting after
         # that frame leaves a window in which an ack is swallowed as
         # already-seen — the same edge-vs-value trap the note below describes
         # for item versions.
-        last_acks = acked_event_ids()
+        last_acks = acked_event_ids(consumed_dir)
 
         if not emit("connected", {}):
             return
@@ -188,7 +191,7 @@ def serve(handler, sid: str, dirs: dict, *, registry, is_terminal) -> None:
                 emit("session-ended", {})
                 return
 
-            new_acks = acked_event_ids()
+            new_acks = acked_event_ids(consumed_dir)
             for event_id in sorted(new_acks - last_acks):
                 if not emit("event-acked", {"event_id": event_id}):
                     return
