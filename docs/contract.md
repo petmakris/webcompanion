@@ -146,6 +146,7 @@ GET    /health
 GET    /api/whoami
 GET    /api/sessions
 GET    /_wc/core.js
+GET    /_wc/favicon.svg
 POST   /api/sessions
 POST   /api/open
 GET    /s/{sid}/
@@ -188,6 +189,7 @@ once URL-decoded. **write** means the ownership check applies.
 | GET | `/api/whoami` | | `{writable: bool}` — whether *this* caller currently passes the ownership check. |
 | GET | `/api/sessions` | (scope=all only) | List sessions. `?cwd=<path>&kind=<kind>` (cwd required) for one project; `?scope=all` for every session on the daemon (owner only). Each row: `{sid, slug, kind, cwd, title, state, url}`, where `state` is `live`, `finished` or `cancelled`. (`state` was added after contract 1 shipped; it is additive, so a client written against the original six keys reads them unchanged.) |
 | GET | `/_wc/core.js` | | The daemon's packaged browser runtime (shared JS every session's page loads). |
+| GET | `/_wc/favicon.svg` | | The tab icon every session's page links to. |
 | POST | `/api/sessions` | write | Create a session. Body: `{kind, cwd, title?, slug?, supersede?}`. `kind` and `cwd` are required (`400` otherwise). `supersede: true` marks every other live session of the same `kind` and `cwd` as finished. Returns `201 {sid, slug, kind, url, token}` — `token` is the daemon's write token, handed to whoever just created the session. |
 | POST | `/api/open` | write | Open a file in the user's editor. Body: `{file, line?}`. `file` is resolved and then must fall inside some existing session's `cwd` (`403` otherwise) — the daemon's only subprocess capability, and this containment check is its entire defence. `404` if not a file; `500` if the editor could not be launched. |
 | GET | `/s/{sid}/` | | The session's HTML shell page: a minimal page that loads `/_wc/core.js` and, if a renderer has registered (see `/api/assets` below), that renderer's entry script. `404 no such session` if `sid` does not resolve. |
