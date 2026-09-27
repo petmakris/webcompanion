@@ -56,6 +56,10 @@ _SID_ITEMS_RE = re.compile(r"^/s/([^/]+)/items$")
 _SID_ITEM_RE = re.compile(r"^/s/([^/]+)/items/(.+)$")
 _SID_ASSETS_REGISTER_RE = re.compile(r"^/s/([^/]+)/api/assets$")
 _SID_ASSET_RE = re.compile(r"^/s/([^/]+)/assets/(.+)$")
+_SID_MOUNTS_REGISTER_RE = re.compile(r"^/s/([^/]+)/api/mounts$")
+_SID_MOUNT_RE = re.compile(r"^/s/([^/]+)/mounts/([^/]+)/(.+)$")
+_MOUNT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9_-]{0,63}$")
+_MOUNTS_MARKER = "mounts.json"
 _SID_UPLOAD_RE = re.compile(r"^/s/([^/]+)/api/upload$")
 _SID_SUBMIT_RE = re.compile(r"^/s/([^/]+)/api/submit$")
 _SID_THREADS_RE = re.compile(r"^/s/([^/]+)/threads$")
@@ -176,6 +180,21 @@ def _read_asset_root(base: Path) -> dict | None:
         return None
     entry = raw.get("entry")
     return {"root": static_root, "entry": entry if isinstance(entry, str) else None}
+
+
+def _read_mounts(base: Path) -> dict:
+    """{name: root} for this session; {} when none are registered or the file is unreadable."""
+    try:
+        raw = json.loads((Path(base) / _MOUNTS_MARKER).read_text())
+    except (OSError, json.JSONDecodeError):
+        return {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: v for k, v in raw.items() if isinstance(k, str) and isinstance(v, str)}
+
+
+def _write_mounts(base: Path, mounts: dict) -> None:
+    write_text_atomic(Path(base) / _MOUNTS_MARKER, json.dumps(mounts, sort_keys=True))
 
 
 def _editor_command(target: Path, line: int | None) -> list[str]:
@@ -366,7 +385,7 @@ def _make_handler(daemon: Daemon):
             self.end_headers()
             self.wfile.write(data)
 
-        def _serve_file(self, path: Path) -> None:
+        def _serve_file(self, path: Path, no_store: bool = False) -> None:
             try:
                 data = path.read_bytes()
             except OSError:
@@ -376,6 +395,8 @@ def _make_handler(daemon: Daemon):
             self.send_response(200)
             self.send_header("Content-Type", ctype or "application/octet-stream")
             self.send_header("Content-Length", str(len(data)))
+            if no_store:
+                self.send_header("Cache-Control", "no-store")
             self.end_headers()
             self.wfile.write(data)
 
@@ -521,6 +542,12 @@ def _make_handler(daemon: Daemon):
                 if resolved is None:
                     return
                 return self._get_thread(dirs, unquote(m.group(2)))
+            m = _SID_MOUNT_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._get_mount(dirs, unquote(m.group(2)), unquote(m.group(3)))
             m = _SID_ASSET_RE.match(path)
             if m:
                 resolved, dirs = self._session(m.group(1))
@@ -558,6 +585,12 @@ def _make_handler(daemon: Daemon):
                 if resolved is None:
                     return
                 return self._register_assets(dirs)
+            m = _SID_MOUNTS_REGISTER_RE.match(path)
+            if m:
+                resolved, dirs = self._session(m.group(1))
+                if resolved is None:
+                    return
+                return self._register_mount(dirs)
             m = _SID_UPLOAD_RE.match(path)
             if m:
                 resolved, dirs = self._session(m.group(1))
@@ -1002,6 +1035,71 @@ def _make_handler(daemon: Daemon):
                 self._text(404, "no such asset")
                 return
             self._serve_file(target)
+
+        # ── mounts: a named project directory, served straight from disk ────
+        def _session_root(self, dirs: dict) -> Path | None:
+            cwd = str(dirs.get("_cwd") or "").strip()
+            if not cwd:
+                return None
+            try:
+                return Path(cwd).resolve()
+            except (OSError, ValueError):
+                return None
+
+        def _register_mount(self, dirs: dict) -> None:
+            if not self._require_owner():
+                return
+            payload = self._body()
+            name, root_raw = payload.get("name"), payload.get("root")
+            if not isinstance(name, str) or not _MOUNT_NAME_RE.match(name):
+                self._text(400, "name must match ^[a-z0-9][a-z0-9_-]{0,63}$")
+                return
+            if not isinstance(root_raw, str) or not root_raw:
+                self._text(400, "root is required")
+                return
+            try:
+                root = Path(root_raw).resolve()
+            except (OSError, ValueError) as e:
+                self._text(400, "root could not be resolved (%s)" % e.__class__.__name__)
+                return
+            if not root.is_dir():
+                self._text(400, "root must be an existing directory")
+                return
+            # The same containment rule /api/open applies: a mount exposes
+            # files to every page on this origin, so only the session's own
+            # project may be mounted.
+            project = self._session_root(dirs)
+            if project is None or not root.is_relative_to(project):
+                self._text(403, "root must be inside the session's cwd")
+                return
+            base = paths.base_of(dirs)
+            mounts = _read_mounts(base)
+            mounts[name] = str(root)
+            _write_mounts(base, mounts)
+            self._json(200, {"name": name, "url": "mounts/%s/" % name})
+
+        def _get_mount(self, dirs: dict, name: str, relpath: str) -> None:
+            root_raw = _read_mounts(paths.base_of(dirs)).get(name)
+            if root_raw is None:
+                self._text(404, "no such mount")
+                return
+            root = Path(root_raw)
+            project = self._session_root(dirs)
+            # Re-checked on every request, as _get_asset re-reads its root:
+            # a directory can be replaced by a symlink after registration.
+            try:
+                root = root.resolve()
+                target = (root / relpath).resolve()
+            except (OSError, ValueError):
+                self._text(403, "forbidden")
+                return
+            if project is None or not root.is_relative_to(project) or not target.is_relative_to(root):
+                self._text(403, "forbidden")
+                return
+            if not target.is_file():
+                self._text(404, "no such file")
+                return
+            self._serve_file(target, no_store=True)
 
         def _core_js(self) -> None:
             with _static_file("core.js") as p:

@@ -1,5 +1,11 @@
 # Changelog
 
+## Unreleased
+
+- Mounts: `POST /s/{sid}/api/mounts` registers a named directory inside the
+  session's `cwd`, and `GET /s/{sid}/mounts/<name>/<relpath>` serves it from
+  disk with `Cache-Control: no-store`. Additive; the contract stays 1.
+
 ## 1.0.0
 
 First release. `webcompanion` replaces five separate per-skill local HTTP

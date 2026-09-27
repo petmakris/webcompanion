@@ -160,6 +160,8 @@ PATCH  /s/{sid}/items
 DELETE /s/{sid}/items/<anchor>
 POST   /s/{sid}/api/assets
 GET    /s/{sid}/assets/<relpath>
+POST   /s/{sid}/api/mounts
+GET    /s/{sid}/mounts/<name>/<relpath>
 POST   /s/{sid}/api/upload
 POST   /s/{sid}/api/submit
 GET    /s/{sid}/threads
@@ -203,6 +205,8 @@ once URL-decoded. **write** means the ownership check applies.
 | DELETE | `/s/{sid}/items/<anchor>` | write | Delete one item. `200 {ok: true}` whether or not the anchor existed. |
 | POST | `/s/{sid}/api/assets` | write | Register a renderer for this session's shell page. Body: `{static_root, entry?}`. `static_root` must resolve to an existing directory; `entry`, if given, is the script tag written into the shell page. Registration is a file in the session's own workspace, not daemon memory, so it survives the daemon's own restarts. |
 | GET | `/s/{sid}/assets/<relpath>` | | Serve a file from the registered `static_root`, containment-checked against symlink escapes. `404 no renderer registered for this session` if nothing has registered yet; `403 forbidden` on an escape attempt; `404 no such asset` otherwise. |
+| POST | `/s/{sid}/api/mounts` | write | Register a named directory to serve from disk. Body: `{name, root}`. `name` matches `^[a-z0-9][a-z0-9_-]{0,63}$` (`400` otherwise); `root` must resolve to an existing directory (`400`) **inside the session's `cwd`** (`403`). Stored in the session's workspace (`mounts.json`), so it survives daemon restarts; re-registering a name replaces its root. Returns `200 {name, url}`, `url` relative to the session page. Additive to contract 1. |
+| GET | `/s/{sid}/mounts/<name>/<relpath>` | | Serve `root/relpath` of a registered mount, symlinks resolved, `403` on an escape from the mount or the session's `cwd`, `404` for an unknown mount or a missing file. Sent with `Cache-Control: no-store`, so a reload after a save always gets the new bytes. Additive to contract 1. |
 | POST | `/s/{sid}/api/upload` | write | Upload a pasted image. Body is the raw image bytes; `Content-Type` must be one of `image/png`, `image/jpeg`, `image/gif`, `image/webp`. `413` past 10 MB, `415` on an unrecognized type, `411` if `Content-Length` is missing. Returns `200 {path, size}`. |
 | POST | `/s/{sid}/api/submit` | write | Submit a comment/interaction event on an anchor. Body: `{anchor, text, images?}` — `images`, if given, must be paths this same session's own `/api/upload` produced. `400` on a missing/invalid anchor or empty text. Returns `202 {event_id}` — the event is queued for a separate watcher process to consume, not answered synchronously. **Whoever answers the event must acknowledge it**, or the watcher re-emits it (3 attempts, 30 minutes apart) and then drops it: run `webcompanion ack --sid <sid> --event-id <event_id>` on the daemon's own host. There is no HTTP route for the acknowledgement — the queue and the ack are files in the session's workspace, and the only consumer runs beside the daemon. |
 | GET | `/s/{sid}/threads` | | Snapshot of every thread: `{anchor: {anchor, version, messages, title?, anchor_text?}}`. |
