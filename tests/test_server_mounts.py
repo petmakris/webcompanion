@@ -86,6 +86,45 @@ def test_an_unknown_mount_or_file_is_404(tmp_path, call):
     assert call("GET", f"/s/{s['sid']}/mounts/deck-1/missing.html")[0] == 404
 
 
+def test_a_dotfile_in_a_mount_is_not_served(tmp_path, call):
+    proj = _project(tmp_path)
+    (proj / ".env").write_text("SECRET=1")
+    (proj / "deck" / ".env").write_text("SECRET=2")
+    s = _session(call, proj)
+    call("POST", f"/s/{s['sid']}/api/mounts", {"name": "root", "root": str(proj)})
+    assert call("GET", f"/s/{s['sid']}/mounts/root/.env")[0] == 404
+    assert call("GET", f"/s/{s['sid']}/mounts/root/deck/.env")[0] == 404
+    assert call("GET", f"/s/{s['sid']}/mounts/root/deck%2F.env")[0] == 404
+
+
+def test_a_dot_directory_in_a_mount_is_not_served(tmp_path, call):
+    proj = _project(tmp_path)
+    (proj / ".git").mkdir()
+    (proj / ".git" / "config").write_text("[remote]")
+    s = _session(call, proj)
+    call("POST", f"/s/{s['sid']}/api/mounts", {"name": "root", "root": str(proj)})
+    assert call("GET", f"/s/{s['sid']}/mounts/root/.git/config")[0] == 404
+    assert call("GET", f"/s/{s['sid']}/mounts/root/deck/index.html") == (200, "<p>deck</p>")
+
+
+def test_a_symlink_onto_a_dotfile_is_not_served(tmp_path, call):
+    proj = _project(tmp_path)
+    (proj / ".env").write_text("SECRET=1")
+    os.symlink(proj / ".env", proj / "plain.txt")
+    s = _session(call, proj)
+    call("POST", f"/s/{s['sid']}/api/mounts", {"name": "root", "root": str(proj)})
+    assert call("GET", f"/s/{s['sid']}/mounts/root/plain.txt")[0] == 404
+
+
+def test_a_mount_under_a_dot_directory_still_serves(tmp_path, call):
+    proj = tmp_path / ".hidden" / "proj"
+    (proj / "deck").mkdir(parents=True)
+    (proj / "deck" / "index.html").write_text("ok")
+    s = _session(call, proj)
+    call("POST", f"/s/{s['sid']}/api/mounts", {"name": "deck-1", "root": str(proj / "deck")})
+    assert call("GET", f"/s/{s['sid']}/mounts/deck-1/index.html") == (200, "ok")
+
+
 def test_a_mount_survives_a_daemon_restart(tmp_path):
     cfg = Config(port=0, token=mint_token(), bind="127.0.0.1", workspace_root=tmp_path / "ws")
     state_root = tmp_path / "state"

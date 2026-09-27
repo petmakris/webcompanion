@@ -1083,6 +1083,13 @@ def _make_handler(daemon: Daemon):
             if root_raw is None:
                 self._text(404, "no such mount")
                 return
+            # A mount is often a whole checkout: never serve .env, .git/ or any other
+            # dotfile, whether it is named in the path or reached through a symlink.
+            # `..` is left to the escape check below, which answers it with 403.
+            segments = relpath.replace("\\", "/").split("/")
+            if any(seg.startswith(".") and seg not in (".", "..") for seg in segments):
+                self._text(404, "no such file")
+                return
             root = Path(root_raw)
             project = self._session_root(dirs)
             # Re-checked on every request, as _get_asset re-reads its root:
@@ -1096,7 +1103,7 @@ def _make_handler(daemon: Daemon):
             if project is None or not root.is_relative_to(project) or not target.is_relative_to(root):
                 self._text(403, "forbidden")
                 return
-            if not target.is_file():
+            if not target.is_file() or any(p.startswith(".") for p in target.relative_to(root).parts):
                 self._text(404, "no such file")
                 return
             self._serve_file(target, no_store=True)
