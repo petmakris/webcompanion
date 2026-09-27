@@ -9,6 +9,7 @@
   :root {
     --bg: #f6f7f9; --card: #fff; --line: #e2e5ea; --ink: #1b1e26;
     --muted: #6b7280; --accent: #3a5cf0; --live: #0f7a50; --live-bg: #e3f3ea;
+    --stale: #b45309; --stale-bg: #fdf0d5;
   }
   * { box-sizing: border-box; }
   body {
@@ -33,10 +34,21 @@
   .title { font-weight: 500; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .where { color: var(--muted); font-size: .8rem; white-space: nowrap; }
   .dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--line); flex: none; align-self: center; }
-  .live .dot { background: var(--live); }
-  .live .title::after {
-    content: "live"; margin-left: .55rem; font-size: .7rem; font-weight: 600;
+  .watching .dot { background: var(--live); }
+  .watching .title::after {
+    content: "watching"; margin-left: .55rem; font-size: .7rem; font-weight: 600;
     color: var(--live); background: var(--live-bg); padding: .1rem .4rem; border-radius: 4px;
+    text-transform: uppercase; letter-spacing: .04em;
+  }
+  /* "live" (not finished/cancelled) with no Claude Code session actually
+     watching -- a comment here queues but nothing answers it. Distinct from
+     .watching on purpose: this used to be indistinguishable from a session
+     that will actually respond, which is the bug this whole badge exists to
+     fix. */
+  .stale .dot { background: var(--stale); }
+  .stale .title::after {
+    content: "unwatched"; margin-left: .55rem; font-size: .7rem; font-weight: 600;
+    color: var(--stale); background: var(--stale-bg); padding: .1rem .4rem; border-radius: 4px;
     text-transform: uppercase; letter-spacing: .04em;
   }
 
@@ -123,6 +135,17 @@ function liveFirst(a, b) {
   return (a.state === "live" ? 0 : 1) - (b.state === "live" ? 0 : 1) || newestFirst(a, b);
 }
 
+// "live" only means "not finished or cancelled" -- it says nothing about
+// whether a Claude Code session is actually watching for a comment, which is
+// exactly what the badge on this page used to claim. 180s matches the
+// daemon's own staleness convention (the IntelliJ plugin's REAP_AFTER_MS, and
+// the same number webcompanion uses elsewhere to decide a watcher is dead).
+const WATCHER_STALE_SECONDS = 180;
+function isWatched(r) {
+  return r.state === "live" && r.watcher_seen_at != null
+    && (Date.now() / 1000 - r.watcher_seen_at) < WATCHER_STALE_SECONDS;
+}
+
 function shorten(cwd) {
   if (!cwd) return "";
   const parts = String(cwd).split("/").filter(Boolean);
@@ -131,7 +154,8 @@ function shorten(cwd) {
 
 function sessionRow(r) {
   const li = el("li");
-  const a = el("a", "row" + (r.state === "live" ? " live" : ""));
+  const cls = r.state !== "live" ? "" : (isWatched(r) ? " watching" : " stale");
+  const a = el("a", "row" + cls);
   a.href = r.url;
   const t = el("span", "title", r.title || r.slug || r.sid);
   const w = el("span", "where", shorten(r.cwd));
@@ -157,9 +181,10 @@ function byKind() {
 
 function renderIndex() {
   const live = rows.filter((r) => r.state === "live").sort(newestFirst);
+  const watching = rows.filter(isWatched);
   const groups = byKind();
   sub.textContent = rows.length
-    ? `${groups.size} tool${groups.size === 1 ? "" : "s"}, ${rows.length} session${rows.length === 1 ? "" : "s"}, ${live.length} live`
+    ? `${groups.size} tool${groups.size === 1 ? "" : "s"}, ${rows.length} session${rows.length === 1 ? "" : "s"}, ${watching.length} watching`
     : "no sessions yet";
 
   view.textContent = "";
@@ -177,7 +202,7 @@ function renderIndex() {
   const kinds = [...groups.keys()].sort();
   for (const kind of kinds) {
     const items = groups.get(kind);
-    const n = items.filter((r) => r.state === "live").length;
+    const n = items.filter(isWatched).length;
     const a = el("a", "kind" + (n ? " has-live" : ""));
     a.href = "#" + encodeURIComponent(kind);
     const name = el("span", "kind-name");
@@ -185,7 +210,7 @@ function renderIndex() {
     name.appendChild(document.createTextNode(kind));
     a.appendChild(name);
     a.appendChild(el("span", "kind-count",
-      n ? `${n} live · ${items.length} total` : `${items.length} session${items.length === 1 ? "" : "s"}`));
+      n ? `${n} watching · ${items.length} total` : `${items.length} session${items.length === 1 ? "" : "s"}`));
     grid.appendChild(a);
   }
   view.appendChild(grid);
@@ -193,9 +218,9 @@ function renderIndex() {
 
 function renderKind(kind) {
   const items = (byKind().get(kind) || []).sort(liveFirst);
-  const n = items.filter((r) => r.state === "live").length;
+  const n = items.filter(isWatched).length;
   sub.textContent = items.length
-    ? `${kind} · ${items.length} session${items.length === 1 ? "" : "s"}, ${n} live`
+    ? `${kind} · ${items.length} session${items.length === 1 ? "" : "s"}, ${n} watching`
     : `${kind} · nothing here`;
 
   view.textContent = "";

@@ -463,6 +463,13 @@ def _make_handler(daemon: Daemon):
                 "cwd": meta.get("cwd", ""),
                 "title": meta.get("title", ""),
                 "state": state,
+                # Additive, like `state` above: "live" only means "not
+                # finished/cancelled", which a reader has no way to tell apart
+                # from "the Claude Code session that would answer a comment
+                # here is long gone" -- this is the same raw fact /poll
+                # already reports per-session, exposed here too so the list
+                # view doesn't need one request per row to show it.
+                "watcher_seen_at": _watcher_seen_at(state_dir) if state_dir is not None else None,
                 "url": f"{self._public_url()}/s/{sid}/",
             }
 

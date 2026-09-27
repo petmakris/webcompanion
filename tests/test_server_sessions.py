@@ -321,6 +321,26 @@ def test_scope_all_lists_every_kind(call):
     assert {r["kind"] for r in rows} == {"annotate", "deck"}
 
 
+def test_scope_all_rows_carry_watcher_seen_at_so_the_list_can_tell_live_from_watched(daemon, call):
+    """`state: "live"` only ever meant "not finished/cancelled" -- it cannot
+    tell a reader whether a Claude Code session is actually watching for a
+    comment. The list view used to have no way to ask, and rendered every
+    live session identically regardless. This is the same raw fact `/poll`
+    already reports per-session (see test_unfinish_clears_the_stale_watcher_
+    heartbeat), exposed here too so the list doesn't need one request per row."""
+    from webcompanion.commands import watch
+
+    _, s = call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})
+    sid = s["sid"]
+    _, rows = call("GET", "/api/sessions?scope=all")
+    assert next(r for r in rows if r["sid"] == sid)["watcher_seen_at"] is None
+
+    state_dir = daemon.registry.lookup(sid)["state_dir"]
+    watch.beat(state_dir)
+    _, rows = call("GET", "/api/sessions?scope=all")
+    assert next(r for r in rows if r["sid"] == sid)["watcher_seen_at"] is not None
+
+
 def test_whoami_reports_writable_on_loopback(call):
     _, body = call("GET", "/api/whoami")
     assert body["writable"] is True
