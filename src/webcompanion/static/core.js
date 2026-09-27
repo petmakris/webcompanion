@@ -222,7 +222,7 @@
     // in flight needs this, because "answered, nothing needed changing" moves
     // no version and is otherwise indistinguishable from "still working".
     es.addEventListener("event-acked", (ev) => {
-      const d = parse(ev);
+      const d = frame(ev);
       if (!d) return;
       onDelta({ kind: "event-acked", anchor: null, version: 0, initial: false,
                 event_id: d.event_id });

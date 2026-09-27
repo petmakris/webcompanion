@@ -258,3 +258,35 @@ def test_a_refused_probe_still_paints_the_page_read_only(live_daemon, tmp_path):
                 "a refusal was retried away"
         finally:
             browser.close()
+
+
+def test_an_ack_reaches_the_page_as_an_event_acked_delta(live_daemon, tmp_path):
+    """The ack is the only signal for an answer that changed nothing (a round
+    of pure `keep` marks). The handler once called `parse(ev)`, a helper that
+    does not exist, so it threw on every ack and the page never heard."""
+    sid = _session_with_bundle(live_daemon, tmp_path)
+    dirs = live_daemon.registry.lookup(live_daemon.registry.resolve(sid))
+    consumed = Path(dirs["consumed_dir"])
+
+    with sync_playwright() as pw:
+        browser = pw.chromium.launch()
+        page = browser.new_page()
+        errors = []
+        page.on("pageerror", lambda e: errors.append(str(e)))
+        try:
+            page.goto(f"{live_daemon.url}/s/{sid}/")
+            page.wait_for_function("() => window.__deltas.length >= 1", timeout=5000)
+            consumed.mkdir(parents=True, exist_ok=True)
+            (consumed / "evt-123.ack").write_text("")
+            # Wake the stream loop now instead of waiting out its idle poll.
+            assert _call(live_daemon, "PUT", f"/s/{sid}/items/a-2", {"t": "x"})[0] == 200
+            page.wait_for_function(
+                "() => window.__deltas.some(d => d.kind === 'event-acked')",
+                timeout=8000)
+            acked = page.evaluate(
+                "() => window.__deltas.filter(d => d.kind === 'event-acked')")
+            assert acked == [{"kind": "event-acked", "anchor": None, "version": 0,
+                              "initial": False, "event_id": "evt-123"}]
+            assert not errors, errors
+        finally:
+            browser.close()
