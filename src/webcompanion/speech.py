@@ -104,3 +104,28 @@ def status(cfg: SpeechConfig) -> dict:
         out["reason"] = ("claude was not found; set CLAUDE_BIN in "
                          "~/.claude/webcompanion/speech.env")
     return out
+
+
+STS_URL = "https://{region}.api.cognitive.microsoft.com/sts/v1.0/issueToken"
+# Azure's tokens live ten minutes. Reporting nine makes the page refresh a
+# minute early instead of finding out from a failed synthesis.
+TOKEN_TTL_REPORTED = 540
+
+
+def mint_token(cfg: SpeechConfig) -> dict:
+    if not (cfg.key and cfg.region):
+        raise SpeechError(503, "speech is not configured: set AZURE_SPEECH_KEY and "
+                               "AZURE_SPEECH_REGION in ~/.claude/webcompanion/speech.env")
+    req = urllib.request.Request(STS_URL.format(region=cfg.region), data=b"",
+                                 method="POST")
+    req.add_header("Ocp-Apim-Subscription-Key", cfg.key)
+    try:
+        with urllib.request.urlopen(req, timeout=10) as r:
+            token = r.read().decode("ascii", "replace").strip()
+    except urllib.error.HTTPError as e:
+        raise SpeechError(502, f"Azure refused the token request (HTTP {e.code})") from None
+    except (urllib.error.URLError, OSError) as e:
+        raise SpeechError(502, f"Azure did not answer ({e.__class__.__name__})") from None
+    if not token:
+        raise SpeechError(502, "Azure returned an empty token")
+    return {"token": token, "region": cfg.region, "expires_in": TOKEN_TTL_REPORTED}

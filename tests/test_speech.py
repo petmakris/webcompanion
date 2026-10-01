@@ -65,3 +65,79 @@ def test_status_names_what_is_missing(tmp_path, monkeypatch):
 def test_status_never_contains_the_key():
     s = speech.status(speech.SpeechConfig("SECRET-KEY-123", "westeurope", None))
     assert "SECRET-KEY-123" not in repr(s)
+
+
+import http.server
+import threading
+
+
+class _FakeSTS:
+    """A local stand-in for Azure's issueToken endpoint."""
+
+    def __init__(self, status=200, body=b"tok-123"):
+        seen = self.seen = []
+
+        class H(http.server.BaseHTTPRequestHandler):
+            def log_message(self, *a):
+                pass
+
+            def do_POST(self):
+                seen.append({"path": self.path,
+                             "key": self.headers.get("Ocp-Apim-Subscription-Key")})
+                self.send_response(status)
+                self.send_header("Content-Length", str(len(body)))
+                self.end_headers()
+                self.wfile.write(body)
+
+        self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.url = f"http://127.0.0.1:{self.srv.server_address[1]}/" + "{region}/sts"
+
+    def close(self):
+        self.srv.shutdown()
+
+
+@pytest.fixture
+def sts(monkeypatch):
+    made = []
+
+    def make(**kw):
+        f = _FakeSTS(**kw)
+        made.append(f)
+        monkeypatch.setattr(speech, "STS_URL", f.url)
+        return f
+    yield make
+    for f in made:
+        f.close()
+
+
+def test_a_token_is_minted_with_the_key_in_the_header(sts):
+    fake = sts()
+    out = speech.mint_token(speech.SpeechConfig("KEY-1", "westeurope", None))
+    assert out == {"token": "tok-123", "region": "westeurope", "expires_in": 540}
+    assert fake.seen == [{"path": "/westeurope/sts", "key": "KEY-1"}]
+
+
+def test_no_key_is_a_503_before_any_request(sts):
+    fake = sts()
+    with pytest.raises(speech.SpeechError) as e:
+        speech.mint_token(speech.SpeechConfig(None, "westeurope", None))
+    assert e.value.status == 503
+    assert fake.seen == []
+
+
+def test_an_azure_refusal_is_a_502_naming_the_status_and_not_the_key(sts):
+    sts(status=401, body=b"Access denied due to invalid subscription key")
+    with pytest.raises(speech.SpeechError) as e:
+        speech.mint_token(speech.SpeechConfig("SECRET-KEY-123", "westeurope", None))
+    assert e.value.status == 502
+    assert "HTTP 401" in e.value.message
+    assert "SECRET-KEY-123" not in e.value.message
+
+
+def test_an_unreachable_azure_is_a_502(monkeypatch):
+    monkeypatch.setattr(speech, "STS_URL", "http://127.0.0.1:9/{region}")
+    with pytest.raises(speech.SpeechError) as e:
+        speech.mint_token(speech.SpeechConfig("k", "westeurope", None))
+    assert e.value.status == 502
+    assert "did not answer" in e.value.message
