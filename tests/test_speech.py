@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import stat
+import warnings
 
 import pytest
 
@@ -68,6 +69,7 @@ def test_status_never_contains_the_key():
 
 
 import http.server
+import socket
 import threading
 
 
@@ -90,11 +92,15 @@ class _FakeSTS:
                 self.wfile.write(body)
 
         self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
+        self.srv.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=False)
+        self.thread.start()
         self.url = f"http://127.0.0.1:{self.srv.server_address[1]}/" + "{region}/sts"
 
     def close(self):
         self.srv.shutdown()
+        self.thread.join()
+        self.srv.server_close()
 
 
 @pytest.fixture
@@ -141,3 +147,27 @@ def test_an_unreachable_azure_is_a_502(monkeypatch):
         speech.mint_token(speech.SpeechConfig("k", "westeurope", None))
     assert e.value.status == 502
     assert "did not answer" in e.value.message
+
+
+def test_a_non_latin1_key_raises_502_not_exposing_the_key(sts):
+    sts()
+    with pytest.raises(speech.SpeechError) as e:
+        speech.mint_token(speech.SpeechConfig("ké€-SECRET", "westeurope", None))
+    assert e.value.status == 502
+    assert "SECRET" not in e.value.message
+
+
+def test_an_empty_token_is_a_502(sts):
+    sts(body=b"")
+    with pytest.raises(speech.SpeechError) as e:
+        speech.mint_token(speech.SpeechConfig("k", "westeurope", None))
+    assert e.value.status == 502
+    assert "empty token" in e.value.message
+
+
+def test_missing_region_is_a_503_before_any_request(sts):
+    fake = sts()
+    with pytest.raises(speech.SpeechError) as e:
+        speech.mint_token(speech.SpeechConfig("k", None, None))
+    assert e.value.status == 503
+    assert fake.seen == []

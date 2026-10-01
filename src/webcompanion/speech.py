@@ -17,6 +17,7 @@ response, an error message or a log line.
 from __future__ import annotations
 
 import hashlib
+import http.client
 import json
 import os
 import shutil
@@ -124,7 +125,7 @@ def mint_token(cfg: SpeechConfig) -> dict:
             token = r.read().decode("ascii", "replace").strip()
     except urllib.error.HTTPError as e:
         raise SpeechError(502, f"Azure refused the token request (HTTP {e.code})") from None
-    except (urllib.error.URLError, OSError) as e:
+    except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
         raise SpeechError(502, f"Azure did not answer ({e.__class__.__name__})") from None
     if not token:
         raise SpeechError(502, "Azure returned an empty token")
