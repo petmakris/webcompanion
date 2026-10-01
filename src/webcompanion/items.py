@@ -15,8 +15,9 @@ and its write cannot be interleaved with any other write. flock is
 per-open-file, so taking it twice in one process deadlocks: code that holds
 the lock must not call `derive_versions`, `snapshot`, `versions_of`, `put`,
 `put_many` or `delete` (each takes it), only `derive_versions_locked` and the
-private `_unlink`. The read paths (`snapshot`, `versions_of`) call
-`derive_versions` exactly once, never through each other.
+private `_unlink`. The read paths (`snapshot`, `versions_of`) load the
+bodies and derive their versions under the one lock, never through each
+other.
 """
 from __future__ import annotations
 
@@ -26,7 +27,7 @@ import urllib.parse
 from pathlib import Path
 
 from webcompanion.atomic import write_text_atomic
-from webcompanion.versions import chain_lock, derive_versions, derive_versions_locked
+from webcompanion.versions import chain_lock, derive_versions_locked
 
 MAX_BODY_BYTES = 2 * 1024 * 1024
 CHAIN_FILE = ".versions.json"
@@ -158,15 +159,27 @@ def load_all(items_dir: Path) -> dict[str, dict]:
     return out
 
 
+def _read_locked(items_dir: Path) -> tuple[dict, dict]:
+    """The bodies and their versions, both read under the chain lock.
+
+    Loading the bodies outside it let a write land between the load and the
+    derive: the stale body went onto the chain as a change, the next read put
+    the new one back, and one write cost two versions — the page's PUT
+    answered 3 while GET said 5, and its next If-Match was refused."""
+    items_dir = Path(items_dir)
+    if not items_dir.is_dir():
+        return {}, {}
+    with chain_lock(items_dir / CHAIN_FILE):
+        bodies = load_all(items_dir)
+        return bodies, derive_versions_locked(items_dir / CHAIN_FILE, bodies)
+
+
 def versions_of(items_dir: Path) -> dict[str, int]:
-    return derive_versions(Path(items_dir) / CHAIN_FILE, load_all(items_dir))
+    return _read_locked(items_dir)[1]
 
 
 def snapshot(items_dir: Path) -> dict[str, dict]:
-    # Calls derive_versions directly, exactly once — never through
-    # versions_of — so this never nests the flock inside itself.
-    bodies = load_all(items_dir)
-    versions = derive_versions(Path(items_dir) / CHAIN_FILE, bodies)
+    bodies, versions = _read_locked(items_dir)
     return {a: {"body": b, "version": versions.get(a, 1)} for a, b in bodies.items()}
 
 

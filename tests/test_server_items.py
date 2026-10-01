@@ -343,3 +343,28 @@ def test_a_write_landing_before_the_keep_patch_takes_the_lock_survives_it(tmp_pa
     assert items.load_one(tmp_path, "held") == {"t": "reader"}
     assert items.load_one(tmp_path, "__holds__") is None
     assert items.load_one(tmp_path, "other") == {"t": 2}
+
+
+def test_a_read_racing_a_write_never_bumps_the_version_twice(tmp_path, monkeypatch):
+    """A read loaded the bodies before a write and derived versions after it:
+    the stale body went onto the chain as a 'change', and the next read put
+    the new one back on — two versions for one write. The reader's PUT had
+    answered 3 while GET said 5."""
+    import threading
+    items.put_if(tmp_path, "a", {"t": 1})
+    real = items.load_all
+    fired = []
+    writer = threading.Thread(target=lambda: items.put_if(tmp_path, "a", {"t": 2}))
+
+    def hooked(d):
+        out = real(d)
+        if not fired:
+            fired.append(1)
+            writer.start()
+            writer.join(0.5)        # a write lands between the read's load and its derive
+        return out
+    monkeypatch.setattr(items, "load_all", hooked)
+    items.snapshot(tmp_path)
+    writer.join(5)
+    monkeypatch.setattr(items, "load_all", real)
+    assert items.versions_of(tmp_path)["a"] == 2
