@@ -218,7 +218,7 @@ def test_an_unreadable_if_match_is_400(call):
     assert call("PUT", f"/s/{sid}/items/b-1", {"t": "x"}, headers={"If-Match": "abc"})[0] == 400
 
 
-def test_two_racing_conditional_puts_cannot_both_win(call, daemon):
+def test_six_racing_conditional_writers_cannot_both_win(call, daemon):
     import threading
     sid = _sid(call)
     call("PUT", f"/s/{sid}/items/b-1", {"t": "a"})
@@ -239,3 +239,50 @@ def test_put_if_does_not_deadlock_and_checks_the_version(tmp_path):
         assert e.current == 2
     else:
         raise AssertionError("expected VersionMismatch")
+
+
+def test_put_many_and_delete_wait_for_the_chain_lock(tmp_path):
+    import threading, time
+    from webcompanion.versions import chain_lock
+    items.put(tmp_path, "a", {"t": 1})
+    done = {}
+    def run(name, fn):
+        fn(); done[name] = time.monotonic()
+    with chain_lock(tmp_path / items.CHAIN_FILE):
+        ts = [threading.Thread(target=run, args=("many", lambda: items.put_many(tmp_path, {"b": {"t": 2}}, replace=True))),
+              threading.Thread(target=run, args=("delete", lambda: items.delete(tmp_path, "a"))),
+              threading.Thread(target=run, args=("put", lambda: items.put(tmp_path, "c", {"t": 3})))]
+        [t.start() for t in ts]
+        time.sleep(0.4)
+        assert done == {}
+    [t.join(5) for t in ts]
+    assert set(done) == {"many", "delete", "put"}
+
+
+def test_a_patch_landing_after_the_check_is_never_overwritten_by_the_stale_put(tmp_path, monkeypatch):
+    import threading
+    items.put(tmp_path, "a", {"t": "orig"})
+    real = items.derive_versions_locked
+    calls = []
+    patcher = threading.Thread(target=lambda: items.put_many(tmp_path, {"a": {"t": "patch"}}))
+    def hooked(*a, **k):
+        out = real(*a, **k)
+        if not calls:
+            calls.append(1)
+            patcher.start()
+            patcher.join(0.5)   # a PATCH racing in right after the version check
+        return out
+    monkeypatch.setattr(items, "derive_versions_locked", hooked)
+    try:
+        items.put_if(tmp_path, "a", {"t": "stale"}, 1)
+    except items.VersionMismatch:
+        pass
+    patcher.join(5)
+    assert items.load_one(tmp_path, "a") == {"t": "patch"}
+
+
+def test_the_put_response_version_is_the_version_get_reports(call):
+    sid = _sid(call)
+    call("PUT", f"/s/{sid}/items/b-1", {"t": "a"})
+    v = call("PUT", f"/s/{sid}/items/b-1", {"t": "b"}, headers={"If-Match": "1"})[1]["version"]
+    assert call("GET", f"/s/{sid}/items/b-1")[1]["version"] == v

@@ -9,13 +9,14 @@ Anchors are client-chosen and become filenames, so they are URL-quoted and
 hashed past a length cap — the same encoding threads.py uses, so an item and
 its comment thread land on matching on-disk names.
 
-`derive_versions` takes an flock on a sidecar lock file spanning its whole
-read-compute-write, and flock is per-process-and-fd: a nested call from
-inside an already-running call would wait on a lock that cannot be released
-until the outer call returns. So every public function here calls
-`derive_versions` at most once, and never while another call to it is on the
-stack — `snapshot` computes versions directly rather than going through
-`versions_of` (which itself calls `derive_versions`).
+Every write (put, put_many, delete, put_if) runs under `versions.chain_lock`,
+the one flock on the sidecar lock file, so a conditional put's version check
+and its write cannot be interleaved with any other write. flock is
+per-open-file, so taking it twice in one process deadlocks: code that holds
+the lock must not call `derive_versions`, `snapshot`, `versions_of`, `put`,
+`put_many` or `delete` (each takes it), only `derive_versions_locked` and the
+private `_unlink`. The read paths (`snapshot`, `versions_of`) call
+`derive_versions` exactly once, never through each other.
 """
 from __future__ import annotations
 
@@ -73,7 +74,8 @@ def _validated_payload(anchor: str, body: dict) -> str:
 def put(items_dir: Path, anchor: str, body: dict) -> None:
     payload = _validated_payload(anchor, body)
     Path(items_dir).mkdir(parents=True, exist_ok=True)
-    write_text_atomic(_path_for(items_dir, anchor), payload)
+    with chain_lock(Path(items_dir) / CHAIN_FILE):
+        write_text_atomic(_path_for(items_dir, anchor), payload)
 
 
 def put_many(items_dir: Path, bodies: dict, replace: bool = False) -> None:
@@ -91,14 +93,23 @@ def put_many(items_dir: Path, bodies: dict, replace: bool = False) -> None:
     """
     payloads = {anchor: _validated_payload(anchor, body) for anchor, body in bodies.items()}
     Path(items_dir).mkdir(parents=True, exist_ok=True)
-    for anchor, payload in payloads.items():
-        write_text_atomic(_path_for(items_dir, anchor), payload)
-    if replace:
-        for anchor in set(load_all(items_dir)) - set(bodies):
-            delete(items_dir, anchor)
+    with chain_lock(Path(items_dir) / CHAIN_FILE):
+        for anchor, payload in payloads.items():
+            write_text_atomic(_path_for(items_dir, anchor), payload)
+        if replace:
+            for anchor in set(load_all(items_dir)) - set(bodies):
+                _unlink(items_dir, anchor)
 
 
 def delete(items_dir: Path, anchor: str) -> bool:
+    if not Path(items_dir).is_dir():
+        return False
+    with chain_lock(Path(items_dir) / CHAIN_FILE):
+        return _unlink(items_dir, anchor)
+
+
+def _unlink(items_dir: Path, anchor: str) -> bool:
+    """Remove one item file. The caller holds the chain lock."""
     try:
         _path_for(items_dir, anchor).unlink()
         return True
