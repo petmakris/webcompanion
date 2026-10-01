@@ -21,6 +21,7 @@ from pathlib import Path
 
 from webcompanion import config as cfgmod
 from webcompanion import paths
+from webcompanion import speech
 from webcompanion.client import Client, ContractMismatch, DaemonUnreachable, HttpError
 from webcompanion.commands.install_service import (
     DEFAULT_LABEL,
@@ -386,6 +387,26 @@ def run(argv: list[str]) -> int:
                   f"preserved as {preserved}")
             print(f"  nothing was overwritten. Salvage it or delete it, then "
                   f"restart; see {marker_path}")
+
+    # Speech is optional: a machine without it still serves every page, so
+    # nothing here can fail the doctor. It prints only whether the key is
+    # set, never the key.
+    env_path = paths.state_root() / speech.ENV_FILE
+    if not env_path.exists():
+        print("speech: not set up (optional) -- read-aloud and dictation need "
+              f"AZURE_SPEECH_KEY and AZURE_SPEECH_REGION in {env_path}")
+    else:
+        scfg = speech.load(paths.state_root())
+        st = speech.status(scfg)
+        key_state = "key set" if scfg.key else "key MISSING"
+        print(f"speech: {key_state}, region {scfg.region or 'MISSING'}, "
+              f"claude {speech.resolve_claude(scfg) or 'NOT FOUND'}")
+        mode = env_path.stat().st_mode & 0o777
+        if mode != 0o600:
+            print(f"  warning: {env_path} has mode {oct(mode)}, expected mode 0600 "
+                  f"-- the Azure key may be readable by other users")
+        if st.get("reason"):
+            print(f"  {st['reason']}")
 
     tail = _log_tail()
     if tail is None:

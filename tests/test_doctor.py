@@ -246,3 +246,23 @@ def test_doctor_reports_a_swallowed_startup_sweep_failure(tmp_path, monkeypatch,
     out = capsys.readouterr().out.lower()
     assert "cleanup" in out
     assert "permissionerror" in out
+
+
+def test_doctor_says_speech_is_optional_when_unset(capsys):
+    doctor.run([])
+    out = capsys.readouterr().out
+    assert "speech: not set up (optional)" in out
+
+
+def test_doctor_reports_speech_without_printing_the_key(capsys):
+    from webcompanion import paths
+    root = paths.state_root()
+    root.mkdir(parents=True, exist_ok=True)
+    env = root / "speech.env"
+    env.write_text("AZURE_SPEECH_KEY=SECRET-KEY-123\nAZURE_SPEECH_REGION=westeurope\n")
+    env.chmod(0o644)
+    doctor.run([])
+    out = capsys.readouterr().out
+    assert "speech: key set, region westeurope" in out
+    assert "expected mode 0600" in out
+    assert "SECRET-KEY-123" not in out
