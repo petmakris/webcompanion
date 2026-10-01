@@ -149,6 +149,9 @@ GET    /_wc/core.js
 GET    /_wc/favicon.svg
 POST   /api/sessions
 POST   /api/open
+GET    /api/speech/status
+POST   /api/speech/token
+POST   /api/speech/script
 GET    /s/{sid}/
 DELETE /s/{sid}/
 GET    /s/{sid}/poll
@@ -194,6 +197,9 @@ once URL-decoded. **write** means the ownership check applies.
 | GET | `/_wc/favicon.svg` | | The tab icon every session's page links to. |
 | POST | `/api/sessions` | write | Create a session. Body: `{kind, cwd, title?, slug?, supersede?}`. `kind` and `cwd` are required (`400` otherwise). `supersede: true` marks every other live session of the same `kind` and `cwd` as finished. Returns `201 {sid, slug, kind, url, token}` — `token` is the daemon's write token, handed to whoever just created the session. |
 | POST | `/api/open` | write | Open a file in the user's editor. Body: `{file, line?}`. `file` is resolved and then must fall inside some existing session's `cwd` (`403` otherwise) — the daemon's only subprocess capability, and this containment check is its entire defence. `404` if not a file; `500` if the editor could not be launched. |
+| GET | `/api/speech/status` | write | Whether speech is set up, for a page deciding whether to offer read-aloud and dictation. Returns `{configured, claude, region?, reason?}`. `configured` means `AZURE_SPEECH_KEY` and `AZURE_SPEECH_REGION` are both set in `~/.claude/webcompanion/speech.env`; `claude` means the `claude` binary was found. Owner only, although it reads, because it tells a caller which Azure region the owner pays for. Never contains the key. |
+| POST | `/api/speech/token` | write | A ten-minute Azure Speech token for the browser SDK. Returns `{token, region, expires_in: 540}`; the 540 makes a client refresh a minute early. `503` when speech is not configured, `502` when Azure refused or did not answer (the body names the HTTP status, never the key). |
+| POST | `/api/speech/script` | write | A spoken explanation of a selection, written by `claude -p --model opus` on the owner's subscription. Body: `{selection, context?, glossary?, page_title?}`, where `glossary` is annotate's `[{term, definition?, role?}]`. Returns `{pieces: [{say, src}], cached}`; `src` is an exact substring of `selection`, or `""` when the model paraphrased. Cached by content for 30 days under `speech-cache/`. `400` for a missing selection or a non-list glossary, `413` over 4,000 characters, `503` when `claude` is not found, `502` when it failed (the body carries its message), `504` after 45 s. |
 | GET | `/s/{sid}/` | | The session's HTML shell page: a minimal page that loads `/_wc/core.js` and, if a renderer has registered (see `/api/assets` below), that renderer's entry script. `404 no such session` if `sid` does not resolve. |
 | DELETE | `/s/{sid}/` | write | **Delete the session and its whole workspace** — registry row, items, threads, uploaded assets, event queue. Irreversible, with no second copy. A session that is not finished or cancelled is refused `409` unless `?force=1`: the one deletion nobody means to make is of something still running, while naming a terminal session is intent enough on its own. Refuses `409` too if the row's workspace is not where its kind's root would have put it, rather than deleting whatever the row points at. Any stream still open on the session is wound down first, so a page that is watching gets `session-ended` instead of finding its directory gone. Returns `200 {ok, sid, kind}`. |
 | GET | `/s/{sid}/poll` | | One-shot state snapshot for clients that are not holding an SSE connection: `{finished, cancelled, watcher_seen_at, items: {anchor: version}, threads: {anchor: version}, acked: [event_id]}`. `acked` lists every answered event id, sorted, so a client on the polling fallback learns of an ack the same way the stream's `event-acked` frame tells an SSE client. |
@@ -216,6 +222,13 @@ once URL-decoded. **write** means the ownership check applies.
 | POST | `/s/{sid}/api/finish` | write | Mark the session finished. Ends its SSE streams (a `session-ended` frame, then close). The daemon can also mark a session finished on its own, with no client call at all — its `idle_expiry_hours` config field (see `README.md`) runs a periodic sweep that finishes any live session idle past that many hours, as a safety net for clients that never call this route themselves. `/api/unfinish` undoes either an explicit or an automatic finish identically. |
 | POST | `/s/{sid}/api/cancel` | write | Mark the session cancelled. Same effect on streams as finish; the two states are reported separately by `/poll`, as `finished` and `cancelled`. `/health` reports neither — it counts sessions and says nothing about their state. |
 | POST | `/s/{sid}/api/unfinish` | write | Undo a `finish`/`cancel`, whether it was manual or automatic: removes the `finished`/`cancelled` marker(s) and the watcher heartbeat file, whichever are present. Idempotent — calling it on a session that is already live is `200 {ok: true}`, not an error. Removing the heartbeat too (not just the markers) matters because a heartbeat that predates the un-finish reads as stale to a polling client, which would otherwise re-latch the session as ended on its very next poll; deleting it restores the same "no watcher yet" state a session that never had one is in. |
+
+The three `/api/speech` routes are the only ones not about sessions, items,
+threads or events. Speech lives in the daemon because every skill's page can
+use it, the key then lives in one place, and the page's own origin needs no
+CORS. The daemon makes only the token and the script. Synthesis and
+recognition run in the browser through Azure's Speech SDK, which keeps the
+daemon free of dependencies.
 
 Every session-scoped route resolves `{sid}` against the daemon's registry
 first; an unresolvable id or slug is `404 no such session` for every one

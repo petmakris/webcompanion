@@ -30,7 +30,7 @@ from pathlib import Path
 from urllib.parse import parse_qs, unquote, urlsplit
 
 from webcompanion import CONTRACT, __version__
-from webcompanion import anchors, build, cleanup, events, gate, items, paths, stream, threads, uploads
+from webcompanion import anchors, build, cleanup, events, gate, items, paths, speech, stream, threads, uploads
 from webcompanion.atomic import write_text_atomic
 from webcompanion.config import Config
 from webcompanion.registry import Registry
@@ -506,6 +506,8 @@ def _make_handler(daemon: Daemon):
                 return self._health()
             if path == "/api/whoami":
                 return self._whoami()
+            if path == "/api/speech/status":
+                return self._speech_status()
             if path == "/api/sessions":
                 return self._list_sessions(parse_qs(parsed.query))
             if path == "/_wc/core.js":
@@ -570,6 +572,10 @@ def _make_handler(daemon: Daemon):
                 return self._create_session()
             if path == "/api/open":
                 return self._open_in_editor()
+            if path == "/api/speech/token":
+                return self._speech_token()
+            if path == "/api/speech/script":
+                return self._speech_script()
             m = _SID_FINISH_RE.match(path)
             if m:
                 return self._finish(m.group(1))
@@ -1213,6 +1219,41 @@ def _make_handler(daemon: Daemon):
                 if target.is_relative_to(root_real):
                     return True
             return False
+
+        # ── speech ──────────────────────────────────────────────────────
+        # Owner only, all three: each spends the owner's Azure money or
+        # Claude subscription. speech.env is re-read per request, so editing
+        # it needs no restart. Error bodies come from speech.SpeechError,
+        # whose messages are written never to contain the key.
+        def _speech_cfg(self) -> "speech.SpeechConfig":
+            return speech.load(daemon.state_root)
+
+        def _speech_status(self) -> None:
+            if not self._require_owner():
+                return
+            self._json(200, speech.status(self._speech_cfg()))
+
+        def _speech_token(self) -> None:
+            if not self._require_owner():
+                return
+            try:
+                self._json(200, speech.mint_token(self._speech_cfg()))
+            except speech.SpeechError as e:
+                self._text(e.status, e.message)
+
+        def _speech_script(self) -> None:
+            if not self._require_owner():
+                return
+            b = self._body()
+            try:
+                out = speech.write_script(
+                    self._speech_cfg(), daemon.state_root / speech.CACHE_DIR,
+                    b.get("selection"), b.get("context") or "",
+                    b.get("glossary"), b.get("page_title") or "")
+            except speech.SpeechError as e:
+                self._text(e.status, e.message)
+                return
+            self._json(200, out)
 
         def _open_in_editor(self) -> None:
             if not self._require_owner():
