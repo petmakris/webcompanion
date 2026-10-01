@@ -21,10 +21,13 @@ import http.client
 import json
 import os
 import shutil
+import signal
 import subprocess
+import threading
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -133,7 +136,6 @@ def mint_token(cfg: SpeechConfig) -> dict:
     return {"token": token, "region": cfg.region, "expires_in": TOKEN_TTL_REPORTED}
 
 
-# append to src/webcompanion/speech.py
 MAX_SELECTION = 4000
 MAX_CONTEXT = 4000
 MAX_GLOSSARY = 200
@@ -227,6 +229,28 @@ def _sweep_cache(cache_dir: Path) -> None:
             pass
 
 
+# One lock per cache key, so identical concurrent requests run claude once:
+# the second waits, then finds the first one's cache entry. An entry is
+# removed when its last user leaves, so the dict does not grow.
+_KEY_LOCKS: dict = {}
+_KEY_LOCKS_GUARD = threading.Lock()
+
+
+@contextmanager
+def _key_lock(key: str):
+    with _KEY_LOCKS_GUARD:
+        entry = _KEY_LOCKS.setdefault(key, [threading.Lock(), 0])
+        entry[1] += 1
+    try:
+        with entry[0]:
+            yield
+    finally:
+        with _KEY_LOCKS_GUARD:
+            entry[1] -= 1
+            if entry[1] == 0:
+                _KEY_LOCKS.pop(key, None)
+
+
 def write_script(cfg: SpeechConfig, cache_dir: Path, selection, context="",
                  glossary=None, page_title="") -> dict:
     if not isinstance(selection, str) or not selection.strip():
@@ -242,7 +266,13 @@ def write_script(cfg: SpeechConfig, cache_dir: Path, selection, context="",
     glossary = glossary[:MAX_GLOSSARY]
 
     cache_dir = Path(cache_dir)
-    hit = cache_dir / f"{cache_key(selection, context, glossary, page_title)}.json"
+    key = cache_key(selection, context, glossary, page_title)
+    with _key_lock(key):
+        return _write_locked(cfg, cache_dir, cache_dir / f"{key}.json", selection,
+                             context, glossary, page_title)
+
+
+def _write_locked(cfg, cache_dir, hit, selection, context, glossary, page_title) -> dict:
     try:
         cached = json.loads(hit.read_text())["pieces"]
         if isinstance(cached, list) and cached:
@@ -260,23 +290,39 @@ def write_script(cfg: SpeechConfig, cache_dir: Path, selection, context="",
             "--system-prompt", SYSTEM_PROMPT,
             build_prompt(selection, context, glossary, page_title)]
     try:
-        proc = subprocess.run(argv, capture_output=True, text=True,
-                              timeout=SCRIPT_TIMEOUT_S, stdin=subprocess.DEVNULL)
-    except subprocess.TimeoutExpired:
-        raise SpeechError(504, f"writing the explanation took longer than "
-                               f"{SCRIPT_TIMEOUT_S} s") from None
+        proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+                                stdin=subprocess.DEVNULL, text=True,
+                                start_new_session=True)
     except OSError as e:
         raise SpeechError(503, f"could not run claude ({e.__class__.__name__})") from None
+    try:
+        stdout, stderr = proc.communicate(timeout=SCRIPT_TIMEOUT_S)
+    except subprocess.TimeoutExpired:
+        # claude may have children; kill the whole process group, not just it.
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        raise SpeechError(504, f"writing the explanation took longer than "
+                               f"{SCRIPT_TIMEOUT_S} s") from None
+    except BaseException:
+        try:
+            os.killpg(proc.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        proc.communicate()
+        raise
 
     try:
-        envelope = json.loads(proc.stdout)
+        envelope = json.loads(stdout)
     except ValueError:
         envelope = None
     if proc.returncode != 0 or not isinstance(envelope, dict) or envelope.get("is_error"):
         if isinstance(envelope, dict) and isinstance(envelope.get("result"), str):
             detail = envelope["result"]
         else:
-            detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+            detail = (stderr or stdout or "").strip() or f"exit {proc.returncode}"
         raise SpeechError(502, f"claude could not write the explanation: {detail[:200]}")
 
     structured = envelope.get("structured_output")

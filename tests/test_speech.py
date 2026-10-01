@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import json as _json
 import os
 import stat
+import threading
+import time
 import warnings
 
 import pytest
@@ -169,9 +172,6 @@ def test_missing_region_is_a_503_before_any_request(sts):
     assert fake.seen == []
 
 
-# append to tests/test_speech.py
-import json as _json
-
 ENVELOPE = {"type": "result", "subtype": "success", "is_error": False,
             "result": "...",
             "structured_output": {"pieces": [
@@ -241,6 +241,7 @@ def test_old_cache_entries_are_swept_on_write(tmp_path):
     os.utime(old, (1, 1))
     speech.write_script(_fake_claude(tmp_path), cache, SELECTION)
     assert not old.exists()
+    assert len(list(cache.glob("*.json"))) == 1
 
 
 @pytest.mark.parametrize("selection", [None, 42, "", "   \n "])
@@ -323,3 +324,45 @@ def test_the_user_prompt_carries_glossary_context_and_title():
     assert "PMP-310 ticket draft" in p and "the paragraph" in p
     assert "EDR: External Data Reference" in p
     assert p.rstrip().endswith(SELECTION)
+
+
+def test_a_timeout_kills_the_whole_process_tree(tmp_path, monkeypatch):
+    monkeypatch.setattr(speech, "SCRIPT_TIMEOUT_S", 1)
+    out = tmp_path / "fake.out"
+    out.write_text("{}")
+    exe = tmp_path / "fake-claude"
+    _exe(exe, "#!/bin/sh\n"
+              f'sleep 30 &\necho $! > "{tmp_path}/child.pid"\nwait\n')
+    cfg = speech.SpeechConfig("k", "r", str(exe))
+    t0 = time.time()
+    with pytest.raises(speech.SpeechError) as e:
+        speech.write_script(cfg, tmp_path / "c", SELECTION)
+    assert e.value.status == 504
+    assert time.time() - t0 < 5
+    pid = int((tmp_path / "child.pid").read_text())
+    for _ in range(20):
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        os.kill(pid, 9)
+        pytest.fail("the grandchild survived the timeout")
+
+
+def test_identical_concurrent_requests_run_claude_once(tmp_path):
+    cfg = _fake_claude(tmp_path, sleep=0.5)
+    results = []
+
+    def go():
+        results.append(speech.write_script(cfg, tmp_path / "c", SELECTION, "ctx"))
+
+    threads = [threading.Thread(target=go) for _ in range(2)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert _runs(tmp_path) == 1
+    assert sorted(r["cached"] for r in results) == [False, True]
+    assert speech._KEY_LOCKS == {}
