@@ -919,13 +919,17 @@ def _make_handler(daemon: Daemon):
                 self._text(400, "items must be an object of anchor -> body")
                 return
             replace = bool(payload.get("replace", False))
+            keep = payload.get("keep", [])
+            if not isinstance(keep, list) or not all(isinstance(a, str) for a in keep):
+                self._text(400, "keep must be a list of anchors")
+                return
             try:
-                items.put_many(dirs["items_dir"], bodies, replace=replace)
+                kept = items.put_many(dirs["items_dir"], bodies, replace=replace, keep=keep)
             except ValueError as e:
                 self._text(400, str(e))
                 return
             daemon.registry.note_change(sid)
-            self._json(200, {"ok": True})
+            self._json(200, {"ok": True, "kept": kept})
 
         def _delete_item(self, sid: str, dirs: dict, anchor: str) -> None:
             if not self._require_owner():

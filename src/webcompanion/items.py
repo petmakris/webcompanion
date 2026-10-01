@@ -78,9 +78,18 @@ def put(items_dir: Path, anchor: str, body: dict) -> None:
         write_text_atomic(_path_for(items_dir, anchor), payload)
 
 
-def put_many(items_dir: Path, bodies: dict, replace: bool = False) -> None:
+def put_many(items_dir: Path, bodies: dict, replace: bool = False,
+             keep=()) -> list[str]:
     """Upsert every anchor in `bodies`. With replace=True, anchors absent from
     `bodies` are deleted — the shape a full document push wants.
+
+    An anchor in `keep` is neither written nor deleted, even when it is in
+    `bodies` or absent under replace. The decision is made under the chain
+    lock, so a write that landed between the caller's read and this call
+    survives it: a full push names what another writer owns (a section the
+    reader holds open) and still sends a copy, so a daemon without `keep`
+    at least does not delete it. Returns the kept anchors that were in
+    `bodies` or in the store.
 
     The whole batch is validated (anchor shape, body size) before any write
     happens, so a single bad anchor or oversized body among many raises
@@ -91,14 +100,21 @@ def put_many(items_dir: Path, bodies: dict, replace: bool = False) -> None:
     protects against the caller's own bad input, which is the failure mode
     that actually happens.
     """
+    keep = set(keep)
+    for anchor in keep:
+        if not valid_anchor(anchor):
+            raise ValueError(f"invalid anchor in keep: {anchor!r}")
     payloads = {anchor: _validated_payload(anchor, body) for anchor, body in bodies.items()}
     Path(items_dir).mkdir(parents=True, exist_ok=True)
     with chain_lock(Path(items_dir) / CHAIN_FILE):
+        existing = set(load_all(items_dir))
         for anchor, payload in payloads.items():
-            write_text_atomic(_path_for(items_dir, anchor), payload)
+            if anchor not in keep:
+                write_text_atomic(_path_for(items_dir, anchor), payload)
         if replace:
-            for anchor in set(load_all(items_dir)) - set(bodies):
+            for anchor in existing - set(bodies) - keep:
                 _unlink(items_dir, anchor)
+        return sorted(keep & (existing | set(bodies)))
 
 
 def delete(items_dir: Path, anchor: str) -> bool:

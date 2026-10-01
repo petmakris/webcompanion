@@ -286,3 +286,60 @@ def test_the_put_response_version_is_the_version_get_reports(call):
     call("PUT", f"/s/{sid}/items/b-1", {"t": "a"})
     v = call("PUT", f"/s/{sid}/items/b-1", {"t": "b"}, headers={"If-Match": "1"})[1]["version"]
     assert call("GET", f"/s/{sid}/items/b-1")[1]["version"] == v
+
+
+# ── PATCH keep: anchors a full push must not touch ─────────────────────────
+
+def test_patch_keep_neither_writes_nor_deletes_its_anchors(call):
+    s = _session(call)
+    call("PATCH", f"/s/{s['sid']}/items",
+         {"items": {"b-1": {"t": "a"}, "b-2": {"t": "reader"}, "h": {"x": 1}}})
+    status, res = call("PATCH", f"/s/{s['sid']}/items",
+                       {"items": {"b-1": {"t": "new"}, "b-2": {"t": "stale copy"}},
+                        "replace": True, "keep": ["b-2", "h", "never-there"]})
+    assert status == 200
+    assert res["kept"] == ["b-2", "h"]
+    _, all_items = call("GET", f"/s/{s['sid']}/items")
+    assert all_items["b-1"]["body"] == {"t": "new"}
+    assert all_items["b-2"]["body"] == {"t": "reader"}, "a kept anchor was written"
+    assert all_items["h"]["body"] == {"x": 1}, "a kept anchor was deleted by replace"
+    assert "never-there" not in all_items
+
+
+def test_patch_without_keep_reports_none_kept(call):
+    s = _session(call)
+    status, res = call("PATCH", f"/s/{s['sid']}/items", {"items": {"b-1": {}}})
+    assert status == 200 and res["kept"] == []
+
+
+def test_an_invalid_keep_is_a_400_and_writes_nothing(call):
+    s = _session(call)
+    call("PUT", f"/s/{s['sid']}/items/b-1", {"t": "orig"})
+    for keep in ("b-1", [1], ["../x"], [""], {"b-1": 1}):
+        status, _ = call("PATCH", f"/s/{s['sid']}/items",
+                         {"items": {"b-1": {"t": "new"}}, "replace": True, "keep": keep})
+        assert status == 400, keep
+    assert call("GET", f"/s/{s['sid']}/items/b-1")[1]["body"] == {"t": "orig"}
+
+
+def test_a_write_landing_before_the_keep_patch_takes_the_lock_survives_it(tmp_path):
+    """The reader's save lands between a push's read and its PATCH: the
+    PATCH, which carries the stale copy, must leave it alone."""
+    import threading, time
+    from webcompanion.atomic import write_text_atomic
+    from webcompanion.versions import chain_lock
+    items.put(tmp_path, "held", {"t": "orig"})
+    items.put(tmp_path, "__holds__", {"held": 1})
+    with chain_lock(tmp_path / items.CHAIN_FILE):
+        t = threading.Thread(target=lambda: items.put_many(
+            tmp_path, {"held": {"t": "orig"}, "__holds__": {"held": 1}, "other": {"t": 2}},
+            replace=True, keep=["held", "__holds__"]))
+        t.start()
+        time.sleep(0.2)
+        # The page's save and its release, already on disk when the PATCH runs.
+        write_text_atomic(items._path_for(tmp_path, "held"), json.dumps({"anchor": "held", "body": {"t": "reader"}}))
+        items._unlink(tmp_path, "__holds__")
+    t.join(5)
+    assert items.load_one(tmp_path, "held") == {"t": "reader"}
+    assert items.load_one(tmp_path, "__holds__") is None
+    assert items.load_one(tmp_path, "other") == {"t": 2}
