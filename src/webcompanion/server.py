@@ -891,13 +891,24 @@ def _make_handler(daemon: Daemon):
         def _put_item(self, sid: str, dirs: dict, anchor: str) -> None:
             if not self._require_owner():
                 return
+            raw = (self.headers.get("If-Match") or "").strip()
+            expected = None
+            if raw:
+                try:
+                    expected = int(raw.strip('"'))
+                except ValueError:
+                    self._text(400, "If-Match must be an item version (an integer)")
+                    return
             try:
-                items.put(dirs["items_dir"], anchor, self._body())
+                version = items.put_if(dirs["items_dir"], anchor, self._body(), expected)
+            except items.VersionMismatch as e:
+                self._json(412, {"version": e.current})
+                return
             except ValueError as e:
                 self._text(400, str(e))
                 return
             daemon.registry.note_change(sid)
-            self._json(200, {"ok": True})
+            self._json(200, {"ok": True, "version": version})
 
         def _patch_items(self, sid: str, dirs: dict) -> None:
             if not self._require_owner():

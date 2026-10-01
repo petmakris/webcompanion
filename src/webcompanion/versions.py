@@ -15,6 +15,7 @@ genuinely generic: key order is not a content change.
 """
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import hashlib
 import json
@@ -47,6 +48,23 @@ def _load_chain(path: Path) -> dict[str, list[str]]:
     }
 
 
+@contextlib.contextmanager
+def chain_lock(chain_path: Path):
+    """Hold the exclusive flock on the chain's sidecar lock file.
+
+    flock is per open file description, so taking it twice in one process
+    (even on the same path) deadlocks. A caller that already holds this lock
+    must call `derive_versions_locked`, never `derive_versions`.
+    """
+    lock_path = Path(str(chain_path) + ".lock")
+    with open(lock_path, "a") as lock_file:
+        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
+        try:
+            yield
+        finally:
+            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def derive_versions(chain_path: Path, bodies: dict[str, dict]) -> dict[str, int]:
     """Return {anchor: version} for `bodies`, growing the chain where content
     changed and pruning anchors no longer present.
@@ -54,31 +72,30 @@ def derive_versions(chain_path: Path, bodies: dict[str, dict]) -> dict[str, int]
     Concurrent calls converge: both read the same tail, both append the same
     hash, and last-writer-wins leaves identical state.
     """
+    with chain_lock(Path(chain_path)):
+        return derive_versions_locked(chain_path, bodies)
+
+
+def derive_versions_locked(chain_path: Path, bodies: dict[str, dict]) -> dict[str, int]:
+    """derive_versions without taking the lock: the caller holds `chain_lock`."""
     chain_path = Path(chain_path)
-    lock_path = Path(str(chain_path) + ".lock")
+    chain = _load_chain(chain_path)
+    changed = False
 
-    with open(lock_path, "a") as lock_file:
-        fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX)
-        try:
-            chain = _load_chain(chain_path)
-            changed = False
+    for stale in [k for k in chain if k not in bodies]:
+        del chain[stale]
+        changed = True
 
-            for stale in [k for k in chain if k not in bodies]:
-                del chain[stale]
-                changed = True
+    for anchor, body in bodies.items():
+        if not isinstance(anchor, str):
+            continue
+        h = body_hash(body if isinstance(body, dict) else {"_": body})
+        history = chain.setdefault(anchor, [])
+        if not history or history[-1] != h:
+            history.append(h)
+            changed = True
 
-            for anchor, body in bodies.items():
-                if not isinstance(anchor, str):
-                    continue
-                h = body_hash(body if isinstance(body, dict) else {"_": body})
-                history = chain.setdefault(anchor, [])
-                if not history or history[-1] != h:
-                    history.append(h)
-                    changed = True
+    if changed:
+        write_text_atomic(chain_path, json.dumps(chain, indent=2))
 
-            if changed:
-                write_text_atomic(chain_path, json.dumps(chain, indent=2))
-
-            return {a: len(chain[a]) for a in bodies if isinstance(a, str)}
-        finally:
-            fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+    return {a: len(chain[a]) for a in bodies if isinstance(a, str)}

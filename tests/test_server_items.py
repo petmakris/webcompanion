@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 from pathlib import Path
 
 from webcompanion import items
@@ -175,3 +176,66 @@ def test_an_item_read_never_pairs_a_new_version_with_an_old_body(call, daemon, m
     monkeypatch.setattr(items, "load_one", load_one_then_a_write_lands)
     _, got = call("GET", f"/s/{sid}/items/b-1")
     assert (got["body"]["t"], got["version"]) in {("old", 1), ("new", 2)}, got
+
+
+def _sid(call):
+    return call("POST", "/api/sessions", {"kind": "annotate", "cwd": "/p", "title": "T"})[1]["sid"]
+
+
+def test_put_returns_the_new_version(call):
+    sid = _sid(call)
+    status, body = call("PUT", f"/s/{sid}/items/b-1", {"t": "a"})
+    assert status == 200 and body == {"ok": True, "version": 1}
+    assert call("PUT", f"/s/{sid}/items/b-1", {"t": "b"})[1]["version"] == 2
+
+
+def test_if_match_on_the_current_version_writes(call):
+    sid = _sid(call)
+    call("PUT", f"/s/{sid}/items/b-1", {"t": "a"})
+    status, body = call("PUT", f"/s/{sid}/items/b-1", {"t": "b"}, headers={"If-Match": "1"})
+    assert status == 200 and body["version"] == 2
+    assert call("GET", f"/s/{sid}/items/b-1")[1]["body"] == {"t": "b"}
+
+
+def test_if_match_on_a_stale_version_is_412_and_writes_nothing(call):
+    sid = _sid(call)
+    call("PUT", f"/s/{sid}/items/b-1", {"t": "a"})
+    call("PUT", f"/s/{sid}/items/b-1", {"t": "claude"})
+    status, body = call("PUT", f"/s/{sid}/items/b-1", {"t": "mine"}, headers={"If-Match": "1"})
+    assert status == 412
+    assert json.loads(body) == {"version": 2}
+    assert call("GET", f"/s/{sid}/items/b-1")[1]["body"] == {"t": "claude"}
+
+
+def test_if_match_on_an_absent_anchor_is_412_with_version_0(call):
+    sid = _sid(call)
+    status, body = call("PUT", f"/s/{sid}/items/nope", {"t": "x"}, headers={"If-Match": "3"})
+    assert status == 412 and json.loads(body) == {"version": 0}
+
+
+def test_an_unreadable_if_match_is_400(call):
+    sid = _sid(call)
+    assert call("PUT", f"/s/{sid}/items/b-1", {"t": "x"}, headers={"If-Match": "abc"})[0] == 400
+
+
+def test_two_racing_conditional_puts_cannot_both_win(call, daemon):
+    import threading
+    sid = _sid(call)
+    call("PUT", f"/s/{sid}/items/b-1", {"t": "a"})
+    results = []
+    def go(t):
+        results.append(call("PUT", f"/s/{sid}/items/b-1", {"t": t}, headers={"If-Match": "1"})[0])
+    ts = [threading.Thread(target=go, args=(f"w{i}",)) for i in range(6)]
+    [t.start() for t in ts]; [t.join() for t in ts]
+    assert sorted(results).count(200) == 1 and results.count(412) == 5
+
+
+def test_put_if_does_not_deadlock_and_checks_the_version(tmp_path):
+    items.put(tmp_path, "a", {"t": 1})
+    assert items.put_if(tmp_path, "a", {"t": 2}, 1) == 2
+    try:
+        items.put_if(tmp_path, "a", {"t": 3}, 1)
+    except items.VersionMismatch as e:
+        assert e.current == 2
+    else:
+        raise AssertionError("expected VersionMismatch")

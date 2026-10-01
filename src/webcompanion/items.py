@@ -25,7 +25,7 @@ import urllib.parse
 from pathlib import Path
 
 from webcompanion.atomic import write_text_atomic
-from webcompanion.versions import derive_versions
+from webcompanion.versions import chain_lock, derive_versions, derive_versions_locked
 
 MAX_BODY_BYTES = 2 * 1024 * 1024
 CHAIN_FILE = ".versions.json"
@@ -141,3 +141,30 @@ def snapshot(items_dir: Path) -> dict[str, dict]:
     bodies = load_all(items_dir)
     versions = derive_versions(Path(items_dir) / CHAIN_FILE, bodies)
     return {a: {"body": b, "version": versions.get(a, 1)} for a, b in bodies.items()}
+
+
+class VersionMismatch(Exception):
+    def __init__(self, current: int):
+        super().__init__(f"version is {current}")
+        self.current = current
+
+
+def put_if(items_dir: Path, anchor: str, body: dict, expected: int | None = None) -> int:
+    """Write `body` under `anchor` when its current version is `expected`
+    (None skips the check) and return the new version.
+
+    The version read, the write and the new version derivation all happen
+    under the one chain lock. Inside it only `derive_versions_locked` is
+    called: `snapshot` and `versions_of` take the lock themselves and would
+    deadlock against this one.
+    """
+    payload = _validated_payload(anchor, body)
+    items_dir = Path(items_dir)
+    items_dir.mkdir(parents=True, exist_ok=True)
+    chain = items_dir / CHAIN_FILE
+    with chain_lock(chain):
+        current = derive_versions_locked(chain, load_all(items_dir)).get(anchor, 0)
+        if expected is not None and current != expected:
+            raise VersionMismatch(current)
+        write_text_atomic(_path_for(items_dir, anchor), payload)
+        return derive_versions_locked(chain, load_all(items_dir))[anchor]
