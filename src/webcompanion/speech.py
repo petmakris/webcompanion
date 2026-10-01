@@ -131,3 +131,160 @@ def mint_token(cfg: SpeechConfig) -> dict:
     if not token:
         raise SpeechError(502, "Azure returned an empty token")
     return {"token": token, "region": cfg.region, "expires_in": TOKEN_TTL_REPORTED}
+
+
+# append to src/webcompanion/speech.py
+MAX_SELECTION = 4000
+MAX_CONTEXT = 4000
+MAX_GLOSSARY = 200
+SCRIPT_TIMEOUT_S = 45
+CACHE_MAX_AGE_S = 30 * 86400
+# Part of every cache key: changing the prompt or the schema must not serve
+# scripts written under the old one. Bump it whenever either changes.
+PROMPT_VERSION = 1
+
+SCRIPT_SCHEMA = {
+    "type": "object",
+    "properties": {"pieces": {"type": "array", "items": {
+        "type": "object",
+        "properties": {"say": {"type": "string"}, "src": {"type": "string"}},
+        "required": ["say", "src"], "additionalProperties": False}}},
+    "required": ["pieces"], "additionalProperties": False,
+}
+
+SYSTEM_PROMPT = """\
+You turn a passage a reader selected into a short spoken explanation. A
+text-to-speech voice will read your words aloud while the reader looks at the
+page.
+
+Rules:
+- Explain what the passage means and why it matters. Do not recite it.
+- Use only what the selection, the surrounding context and the glossary say.
+  Never guess what a term, acronym, name or code means. If nothing given to
+  you defines an abbreviation, say it letter by letter (EDR becomes "E-D-R")
+  and do not explain it.
+- Expand an abbreviation the glossary or the context defines, the first time
+  it is spoken.
+- Say codes, numbers and symbols the way a person would: "06a/07a" becomes
+  "zero-six-A and zero-seven-A", "21 Aug" becomes "August twenty-first", "&"
+  becomes "and".
+- Leave out citations that are not content, such as "transcript lines 29-34".
+- Split the explanation into pieces of one or two sentences, in the order of
+  the selection. Each piece's "src" is the exact substring of the selection
+  that the piece explains, copied character for character.
+- Plain spoken English. No markdown, lists, parentheses or emoji.
+"""
+
+
+def _glossary_lines(glossary: list) -> list[str]:
+    lines = []
+    for g in glossary:
+        if not isinstance(g, dict) or not isinstance(g.get("term"), str) or not g["term"]:
+            continue
+        rest = " ".join(str(g.get(k) or "").strip() for k in ("definition", "role")).strip()
+        lines.append(f"- {g['term']}: {rest}".rstrip(": ").rstrip())
+    return lines
+
+
+def build_prompt(selection: str, context: str, glossary: list, page_title: str) -> str:
+    gl = "\n".join(_glossary_lines(glossary)) or "(none)"
+    return (f"Page title: {page_title or '(none)'}\n\n"
+            f"Glossary:\n{gl}\n\n"
+            f"Surrounding context:\n{context or '(none)'}\n\n"
+            f"Selection to explain:\n{selection}\n")
+
+
+def cache_key(selection: str, context: str, glossary: list, page_title: str) -> str:
+    raw = json.dumps([PROMPT_VERSION, selection, context, glossary, page_title],
+                     sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(raw.encode("utf-8")).hexdigest()
+
+
+def _clean_pieces(raw, selection: str) -> list[dict]:
+    """Keep every piece with something to say. A `src` that is not an exact
+    substring of the selection is blanked rather than dropped: the model
+    paraphrases, and losing a sentence of the explanation is worse than that
+    sentence not lighting the page."""
+    out = []
+    for p in raw if isinstance(raw, list) else []:
+        if not isinstance(p, dict):
+            continue
+        say, src = p.get("say"), p.get("src")
+        if not isinstance(say, str) or not say.strip():
+            continue
+        ok = isinstance(src, str) and src != "" and src in selection
+        out.append({"say": say.strip(), "src": src if ok else ""})
+    return out
+
+
+def _sweep_cache(cache_dir: Path) -> None:
+    cutoff = time.time() - CACHE_MAX_AGE_S
+    for f in cache_dir.glob("*.json"):
+        try:
+            if f.stat().st_mtime < cutoff:
+                f.unlink()
+        except OSError:
+            pass
+
+
+def write_script(cfg: SpeechConfig, cache_dir: Path, selection, context="",
+                 glossary=None, page_title="") -> dict:
+    if not isinstance(selection, str) or not selection.strip():
+        raise SpeechError(400, "selection is required")
+    if len(selection) > MAX_SELECTION:
+        raise SpeechError(413, f"selection is over {MAX_SELECTION} characters")
+    if glossary is None:
+        glossary = []
+    if not isinstance(glossary, list):
+        raise SpeechError(400, "glossary must be a list")
+    context = context[:MAX_CONTEXT] if isinstance(context, str) else ""
+    page_title = page_title if isinstance(page_title, str) else ""
+    glossary = glossary[:MAX_GLOSSARY]
+
+    cache_dir = Path(cache_dir)
+    hit = cache_dir / f"{cache_key(selection, context, glossary, page_title)}.json"
+    try:
+        cached = json.loads(hit.read_text())["pieces"]
+        if isinstance(cached, list) and cached:
+            return {"pieces": cached, "cached": True}
+    except (OSError, ValueError, KeyError, TypeError):
+        pass
+
+    claude = resolve_claude(cfg)
+    if claude is None:
+        raise SpeechError(503, "claude was not found; set CLAUDE_BIN in "
+                               "~/.claude/webcompanion/speech.env")
+    argv = [claude, "-p", "--model", "opus", "--tools", "",
+            "--no-session-persistence", "--setting-sources", "",
+            "--output-format", "json", "--json-schema", json.dumps(SCRIPT_SCHEMA),
+            "--system-prompt", SYSTEM_PROMPT,
+            build_prompt(selection, context, glossary, page_title)]
+    try:
+        proc = subprocess.run(argv, capture_output=True, text=True,
+                              timeout=SCRIPT_TIMEOUT_S, stdin=subprocess.DEVNULL)
+    except subprocess.TimeoutExpired:
+        raise SpeechError(504, f"writing the explanation took longer than "
+                               f"{SCRIPT_TIMEOUT_S} s") from None
+    except OSError as e:
+        raise SpeechError(503, f"could not run claude ({e.__class__.__name__})") from None
+
+    try:
+        envelope = json.loads(proc.stdout)
+    except ValueError:
+        envelope = None
+    if proc.returncode != 0 or not isinstance(envelope, dict) or envelope.get("is_error"):
+        if isinstance(envelope, dict) and isinstance(envelope.get("result"), str):
+            detail = envelope["result"]
+        else:
+            detail = (proc.stderr or proc.stdout or "").strip() or f"exit {proc.returncode}"
+        raise SpeechError(502, f"claude could not write the explanation: {detail[:200]}")
+
+    structured = envelope.get("structured_output")
+    pieces = _clean_pieces(structured.get("pieces") if isinstance(structured, dict) else None,
+                           selection)
+    if not pieces:
+        raise SpeechError(502, "claude returned no explanation")
+    cache_dir.mkdir(parents=True, exist_ok=True)
+    write_text_atomic(hit, json.dumps({"pieces": pieces}, ensure_ascii=False))
+    _sweep_cache(cache_dir)
+    return {"pieces": pieces, "cached": False}

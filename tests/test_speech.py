@@ -167,3 +167,159 @@ def test_missing_region_is_a_503_before_any_request(sts):
         speech.mint_token(speech.SpeechConfig("k", None, None))
     assert e.value.status == 503
     assert fake.seen == []
+
+
+# append to tests/test_speech.py
+import json as _json
+
+ENVELOPE = {"type": "result", "subtype": "success", "is_error": False,
+            "result": "...",
+            "structured_output": {"pieces": [
+                {"src": "The spec (use case 06a/07a)", "say": "The spec, in use cases zero-six-A and zero-seven-A,"},
+                {"src": "a paraphrase not in the text", "say": "says Europe and Switzerland."},
+                {"src": "", "say": "   "}]}}
+SELECTION = "The spec (use case 06a/07a) says Europe & CH First/Premium."
+
+
+def _fake_claude(tmp_path, envelope=ENVELOPE, exit_code=0, sleep=0):
+    """A stand-in for `claude -p`. It records its argv and how often it ran,
+    and prints a fixed envelope."""
+    out = tmp_path / "fake.out"
+    out.write_text(_json.dumps(envelope) if isinstance(envelope, dict) else envelope)
+    exe = tmp_path / "fake-claude"
+    _exe(exe, "#!/bin/sh\n"
+              f'echo run >> "{tmp_path}/fake.count"\n'
+              f'printf "%s\\n" "$@" > "{tmp_path}/fake.argv"\n'
+              f"sleep {sleep}\n"
+              f'cat "{out}"\n'
+              f"exit {exit_code}\n")
+    return speech.SpeechConfig("k", "westeurope", str(exe))
+
+
+def _runs(tmp_path):
+    p = tmp_path / "fake.count"
+    return len(p.read_text().splitlines()) if p.exists() else 0
+
+
+def test_pieces_come_back_with_unmatched_src_blanked_and_empty_say_dropped(tmp_path):
+    cfg = _fake_claude(tmp_path)
+    out = speech.write_script(cfg, tmp_path / "cache", SELECTION, "ctx", [], "PMP-310")
+    assert out == {"cached": False, "pieces": [
+        {"say": "The spec, in use cases zero-six-A and zero-seven-A,",
+         "src": "The spec (use case 06a/07a)"},
+        {"say": "says Europe and Switzerland.", "src": ""}]}
+
+
+def test_claude_is_called_headless_with_opus_no_tools_and_the_schema(tmp_path):
+    cfg = _fake_claude(tmp_path)
+    speech.write_script(cfg, tmp_path / "cache", SELECTION)
+    argv = (tmp_path / "fake.argv").read_text().split("\n")
+    for flag in ("-p", "--no-session-persistence", "--output-format", "--json-schema",
+                 "--system-prompt"):
+        assert flag in argv
+    assert argv[argv.index("--model") + 1] == "opus"
+    assert argv[argv.index("--tools") + 1] == ""
+    assert argv[argv.index("--setting-sources") + 1] == ""
+    assert _json.loads(argv[argv.index("--json-schema") + 1]) == speech.SCRIPT_SCHEMA
+
+
+def test_a_second_identical_request_is_served_from_the_cache(tmp_path):
+    cfg = _fake_claude(tmp_path)
+    a = speech.write_script(cfg, tmp_path / "cache", SELECTION, "ctx", [{"term": "EDR"}], "T")
+    b = speech.write_script(cfg, tmp_path / "cache", SELECTION, "ctx", [{"term": "EDR"}], "T")
+    assert b == {**a, "cached": True}
+    assert _runs(tmp_path) == 1
+    speech.write_script(cfg, tmp_path / "cache", SELECTION, "other ctx", [{"term": "EDR"}], "T")
+    assert _runs(tmp_path) == 2
+
+
+def test_old_cache_entries_are_swept_on_write(tmp_path):
+    cache = tmp_path / "cache"
+    cache.mkdir()
+    old = cache / ("0" * 64 + ".json")
+    old.write_text("{}")
+    os.utime(old, (1, 1))
+    speech.write_script(_fake_claude(tmp_path), cache, SELECTION)
+    assert not old.exists()
+
+
+@pytest.mark.parametrize("selection", [None, 42, "", "   \n "])
+def test_a_missing_or_blank_selection_is_a_400(tmp_path, selection):
+    with pytest.raises(speech.SpeechError) as e:
+        speech.write_script(_fake_claude(tmp_path), tmp_path / "c", selection)
+    assert e.value.status == 400
+    assert _runs(tmp_path) == 0
+
+
+def test_a_selection_over_the_limit_is_a_413(tmp_path):
+    with pytest.raises(speech.SpeechError) as e:
+        speech.write_script(_fake_claude(tmp_path), tmp_path / "c", "x" * 4001)
+    assert e.value.status == 413
+
+
+def test_a_glossary_that_is_not_a_list_is_a_400(tmp_path):
+    with pytest.raises(speech.SpeechError) as e:
+        speech.write_script(_fake_claude(tmp_path), tmp_path / "c", SELECTION, "", "EDR")
+    assert e.value.status == 400
+
+
+def test_glossary_entries_without_a_term_are_ignored_not_fatal(tmp_path):
+    out = speech.write_script(_fake_claude(tmp_path), tmp_path / "c", SELECTION, "",
+                              [{"definition": "no term"}, "junk", {"term": "EDR", "definition": "x"}])
+    assert out["pieces"]
+
+
+def test_claude_not_found_is_a_503(tmp_path, monkeypatch):
+    monkeypatch.setattr(speech.shutil, "which", lambda _: None)
+    cfg = speech.SpeechConfig("k", "r", str(tmp_path / "nope"))
+    with pytest.raises(speech.SpeechError) as e:
+        speech.write_script(cfg, tmp_path / "c", SELECTION)
+    assert e.value.status == 503
+    assert "claude was not found" in e.value.message
+
+
+def test_claude_not_logged_in_is_a_502_with_its_own_words(tmp_path):
+    cfg = _fake_claude(tmp_path, envelope={"type": "result", "is_error": True,
+                                           "result": "Not logged in · Please run /login"},
+                       exit_code=1)
+    with pytest.raises(speech.SpeechError) as e:
+        speech.write_script(cfg, tmp_path / "c", SELECTION)
+    assert e.value.status == 502
+    assert "Not logged in" in e.value.message
+
+
+def test_output_that_is_not_json_is_a_502(tmp_path):
+    cfg = _fake_claude(tmp_path, envelope="segfault\n", exit_code=139)
+    with pytest.raises(speech.SpeechError) as e:
+        speech.write_script(cfg, tmp_path / "c", SELECTION)
+    assert e.value.status == 502
+
+
+def test_a_slow_claude_is_a_504(tmp_path, monkeypatch):
+    monkeypatch.setattr(speech, "SCRIPT_TIMEOUT_S", 1)
+    with pytest.raises(speech.SpeechError) as e:
+        speech.write_script(_fake_claude(tmp_path, sleep=3), tmp_path / "c", SELECTION)
+    assert e.value.status == 504
+
+
+def test_no_usable_piece_is_a_502(tmp_path):
+    env = {**ENVELOPE, "structured_output": {"pieces": [{"src": "", "say": ""}]}}
+    with pytest.raises(speech.SpeechError) as e:
+        speech.write_script(_fake_claude(tmp_path, envelope=env), tmp_path / "c", SELECTION)
+    assert e.value.status == 502
+
+
+def test_the_prompt_forbids_guessing_and_spells_undefined_abbreviations():
+    p = speech.SYSTEM_PROMPT.lower()
+    assert "never guess" in p
+    assert "letter by letter" in p
+    assert "exact" in p and "substring" in p
+
+
+def test_the_user_prompt_carries_glossary_context_and_title():
+    p = speech.build_prompt(SELECTION, "the paragraph",
+                            [{"term": "EDR", "definition": "External Data Reference", "role": "confirms segments"}],
+                            "PMP-310 ticket draft")
+    assert "PMP-310 ticket draft" in p and "the paragraph" in p
+    assert "EDR: External Data Reference" in p
+    assert p.rstrip().endswith(SELECTION)
