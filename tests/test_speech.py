@@ -69,7 +69,6 @@ def test_status_never_contains_the_key():
 
 
 import http.server
-import socket
 import threading
 
 
@@ -92,14 +91,11 @@ class _FakeSTS:
                 self.wfile.write(body)
 
         self.srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
-        self.srv.socket.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
-        self.thread = threading.Thread(target=self.srv.serve_forever, daemon=False)
-        self.thread.start()
+        threading.Thread(target=self.srv.serve_forever, daemon=True).start()
         self.url = f"http://127.0.0.1:{self.srv.server_address[1]}/" + "{region}/sts"
 
     def close(self):
         self.srv.shutdown()
-        self.thread.join()
         self.srv.server_close()
 
 

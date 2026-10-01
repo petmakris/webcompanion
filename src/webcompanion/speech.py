@@ -124,6 +124,7 @@ def mint_token(cfg: SpeechConfig) -> dict:
         with urllib.request.urlopen(req, timeout=10) as r:
             token = r.read().decode("ascii", "replace").strip()
     except urllib.error.HTTPError as e:
+        e.close()
         raise SpeechError(502, f"Azure refused the token request (HTTP {e.code})") from None
     except (urllib.error.URLError, OSError, ValueError, http.client.HTTPException) as e:
         raise SpeechError(502, f"Azure did not answer ({e.__class__.__name__})") from None
