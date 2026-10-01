@@ -251,6 +251,11 @@ def _key_lock(key: str):
                 _KEY_LOCKS.pop(key, None)
 
 
+# At most two claude runs at once (each is a 78K-token-class opus call); a
+# third caller is told to retry rather than queued behind a 45 s timeout.
+_RUN_SLOTS = threading.BoundedSemaphore(2)
+
+
 def write_script(cfg: SpeechConfig, cache_dir: Path, selection, context="",
                  glossary=None, page_title="") -> dict:
     if not isinstance(selection, str) or not selection.strip():
@@ -286,17 +291,28 @@ def _write_locked(cfg, cache_dir, hit, selection, context, glossary, page_title)
                                "~/.claude/webcompanion/speech.env")
     argv = [claude, "-p", "--model", "opus", "--tools", "",
             "--no-session-persistence", "--setting-sources", "",
+            "--strict-mcp-config",
             "--output-format", "json", "--json-schema", json.dumps(SCRIPT_SCHEMA),
-            "--system-prompt", SYSTEM_PROMPT,
-            build_prompt(selection, context, glossary, page_title)]
+            "--system-prompt", SYSTEM_PROMPT]
+    prompt = build_prompt(selection, context, glossary, page_title)
+    if not _RUN_SLOTS.acquire(blocking=False):
+        raise SpeechError(503, "busy: two explanations are already being written; "
+                               "try again in a moment")
+    try:
+        return _run_claude(argv, prompt, cache_dir, hit, selection)
+    finally:
+        _RUN_SLOTS.release()
+
+
+def _run_claude(argv, prompt, cache_dir, hit, selection) -> dict:
     try:
         proc = subprocess.Popen(argv, stdout=subprocess.PIPE, stderr=subprocess.PIPE,
-                                stdin=subprocess.DEVNULL, text=True,
-                                start_new_session=True)
+                                stdin=subprocess.PIPE, encoding="utf-8",
+                                errors="replace", start_new_session=True)
     except OSError as e:
         raise SpeechError(503, f"could not run claude ({e.__class__.__name__})") from None
     try:
-        stdout, stderr = proc.communicate(timeout=SCRIPT_TIMEOUT_S)
+        stdout, stderr = proc.communicate(input=prompt, timeout=SCRIPT_TIMEOUT_S)
     except subprocess.TimeoutExpired:
         # claude may have children; kill the whole process group, not just it.
         try:
@@ -330,7 +346,10 @@ def _write_locked(cfg, cache_dir, hit, selection, context, glossary, page_title)
                            selection)
     if not pieces:
         raise SpeechError(502, "claude returned no explanation")
-    cache_dir.mkdir(parents=True, exist_ok=True)
-    write_text_atomic(hit, json.dumps({"pieces": pieces}, ensure_ascii=False))
-    _sweep_cache(cache_dir)
+    try:  # the cache is best-effort: a full disk must not lose the pieces
+        cache_dir.mkdir(parents=True, exist_ok=True)
+        write_text_atomic(hit, json.dumps({"pieces": pieces}, ensure_ascii=False))
+        _sweep_cache(cache_dir)
+    except OSError:
+        pass
     return {"pieces": pieces, "cached": False}

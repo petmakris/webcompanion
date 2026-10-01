@@ -5,7 +5,6 @@ import os
 import stat
 import threading
 import time
-import warnings
 
 import pytest
 
@@ -72,7 +71,6 @@ def test_status_never_contains_the_key():
 
 
 import http.server
-import threading
 
 
 class _FakeSTS:
@@ -190,6 +188,7 @@ def _fake_claude(tmp_path, envelope=ENVELOPE, exit_code=0, sleep=0):
     _exe(exe, "#!/bin/sh\n"
               f'echo run >> "{tmp_path}/fake.count"\n'
               f'printf "%s\\n" "$@" > "{tmp_path}/fake.argv"\n'
+              f'cat > "{tmp_path}/fake.stdin"\n'
               f"sleep {sleep}\n"
               f'cat "{out}"\n'
               f"exit {exit_code}\n")
@@ -220,6 +219,11 @@ def test_claude_is_called_headless_with_opus_no_tools_and_the_schema(tmp_path):
     assert argv[argv.index("--model") + 1] == "opus"
     assert argv[argv.index("--tools") + 1] == ""
     assert argv[argv.index("--setting-sources") + 1] == ""
+    assert "--strict-mcp-config" in argv
+    assert "--mcp-config" not in argv
+    # The prompt travels on stdin: not in argv, so not in `ps` and no ARG_MAX.
+    assert SELECTION not in "\n".join(argv)
+    assert SELECTION in (tmp_path / "fake.stdin").read_text()
     assert _json.loads(argv[argv.index("--json-schema") + 1]) == speech.SCRIPT_SCHEMA
 
 
@@ -366,3 +370,45 @@ def test_identical_concurrent_requests_run_claude_once(tmp_path):
     assert _runs(tmp_path) == 1
     assert sorted(r["cached"] for r in results) == [False, True]
     assert speech._KEY_LOCKS == {}
+
+
+def test_odd_bytes_from_claude_do_not_raise_a_decode_error(tmp_path):
+    out = tmp_path / "fake.out"
+    out.write_bytes(b"\xff\xfe not json\n")
+    exe = _exe(tmp_path / "fake-claude", f'#!/bin/sh\ncat > /dev/null\ncat "{out}"\nexit 1\n')
+    cfg = speech.SpeechConfig("k", "r", str(exe))
+    with pytest.raises(speech.SpeechError) as e:
+        speech.write_script(cfg, tmp_path / "c", SELECTION)
+    assert e.value.status == 502
+
+
+def test_a_cache_that_cannot_be_written_still_returns_the_pieces(tmp_path):
+    cfg = _fake_claude(tmp_path)
+    blocker = tmp_path / "cache"
+    blocker.write_text("a regular file, so mkdir fails")
+    out = speech.write_script(cfg, blocker, SELECTION)
+    assert out["cached"] is False and len(out["pieces"]) == 2
+
+
+def test_only_two_claude_runs_at_once_and_the_third_is_a_503(tmp_path):
+    cfg = _fake_claude(tmp_path, sleep=1)
+    results, errors = [], []
+
+    def go(i):
+        try:
+            results.append(speech.write_script(cfg, tmp_path / "c", f"{SELECTION} {i}"))
+        except speech.SpeechError as e:
+            errors.append(e)
+
+    threads = [threading.Thread(target=go, args=(i,)) for i in range(3)]
+    for th in threads:
+        th.start()
+    for th in threads:
+        th.join()
+    assert len(errors) == 1 and errors[0].status == 503
+    assert "busy" in errors[0].message
+    assert len(results) == 2
+    assert _runs(tmp_path) == 2
+    # The slot is released: a later request runs.
+    speech.write_script(cfg, tmp_path / "c", SELECTION + " later")
+    assert _runs(tmp_path) == 3
