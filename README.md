@@ -147,8 +147,24 @@ not `0600`, and reports whether `sessions.json` beside it still parses.
 | `webcompanion unfinish` | Reopen a session `end` (or the `idle_expiry_hours` safety net) marked finished or cancelled — no data was ever touched, so this always works. |
 | `webcompanion watch` | Follow a session's event queue, printing one banner per event. Fails if the sid is not a registered session; it never creates one. |
 | `webcompanion ack` | Acknowledge an event by id. **Required after answering one** — see below. |
+| `webcompanion event` | Print one event's stored JSON in full, by id. **Read the event with it before answering** — see below. |
 | `webcompanion migrate` | Move workspaces out of the five older per-skill roots. |
 | `webcompanion serve` | Run the daemon in the foreground. This is what the service execs; you do not normally run it yourself. |
+
+### Read the event from the store, not from the banner
+
+`watch` prints the payload after the banner, but a reader of that stream may
+cut it short. Claude Code's Monitor tool truncates a long notification and
+ends it with `...(truncated)`, and a round of several comments is exactly the
+payload that runs long. Take the sid and event id from the banner and read
+the event itself:
+
+```bash
+webcompanion event --sid <sid> --event-id <id>
+```
+
+It reads the event file where it lies, waiting or already archived, and needs
+no daemon.
 
 ### Answering an event means acknowledging it
 

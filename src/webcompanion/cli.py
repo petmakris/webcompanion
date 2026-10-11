@@ -7,7 +7,7 @@ from webcompanion import CONTRACT, __version__
 
 SUBCOMMANDS = (
     "serve", "push", "update", "assets", "reply", "end", "unfinish", "forget",
-    "watch", "ack",
+    "watch", "ack", "event",
     "install-service", "uninstall", "status", "doctor", "migrate",
 )
 
