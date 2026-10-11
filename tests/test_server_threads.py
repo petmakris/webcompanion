@@ -192,6 +192,21 @@ def test_poll_reports_the_watchers_heartbeat_instead_of_null_forever(
     assert abs(seen - time.time()) < 5
 
 
+def test_poll_reports_a_stopped_watcher_until_a_new_one_beats(daemon, call, sid):
+    from webcompanion.commands import watch
+
+    state_dir = daemon.registry.lookup(sid)["state_dir"]
+    assert call("GET", f"/s/{sid}/poll")[1]["watcher_stopped_at"] is None
+
+    watch.mark_stopped(state_dir, watch.beat(state_dir))
+    _, poll = call("GET", f"/s/{sid}/poll")
+    assert isinstance(poll["watcher_stopped_at"], int)
+    assert poll["watcher_seen_at"] is not None
+
+    watch.beat(state_dir)
+    assert call("GET", f"/s/{sid}/poll")[1]["watcher_stopped_at"] is None
+
+
 def test_an_unreadable_heartbeat_reads_as_no_watcher_not_a_500(daemon, call, sid):
     from pathlib import Path
 

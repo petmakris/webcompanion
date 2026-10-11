@@ -310,3 +310,97 @@ def test_ack_refuses_an_unknown_sid_and_a_path_shaped_event_id(tmp_path, capsys)
 def test_ack_is_a_registered_subcommand():
     from webcompanion import cli
     assert "ack" in cli.SUBCOMMANDS
+
+
+# ── a stopped watch says so ─────────────────────────────────────────────
+
+def _session_dirs(tmp_path):
+    state_dir = tmp_path / "state"
+    state_dir.mkdir()
+    return state_dir, state_dir / "events", state_dir / "consumed"
+
+
+def test_a_watch_whose_parent_is_gone_writes_the_stopped_marker(tmp_path):
+    state_dir, events_dir, consumed_dir = _session_dirs(tmp_path)
+    beats = []
+
+    def parent_gone():
+        beats.append(1)
+        return len(beats) > 2
+
+    rc = run_with_hard_timeout(lambda: watch.watch_loop(
+        "annotate", "sid1", state_dir, events_dir, consumed_dir,
+        out=io.StringIO(), poll_seconds=0.001, sleep=lambda _: None,
+        parent_gone=parent_gone))
+
+    assert rc == 0
+    assert (state_dir / "watcher_heartbeat").exists()
+    assert int((state_dir / "watcher_stopped").read_text()) >= int(
+        (state_dir / "watcher_heartbeat").read_text())
+
+
+def test_an_interrupted_watch_writes_the_stopped_marker(tmp_path):
+    state_dir, events_dir, consumed_dir = _session_dirs(tmp_path)
+
+    def sleep(_):
+        raise KeyboardInterrupt
+
+    try:
+        rc = run_with_hard_timeout(lambda: watch.watch_loop(
+            "annotate", "sid1", state_dir, events_dir, consumed_dir,
+            out=io.StringIO(), poll_seconds=0.001, sleep=sleep))
+    except KeyboardInterrupt:
+        pytest.fail("Ctrl-C escaped the watch instead of ending it cleanly")
+
+    assert rc == 0
+    assert (state_dir / "watcher_stopped").exists()
+
+
+def test_a_stop_never_marks_a_session_another_watcher_has_taken_over(tmp_path):
+    state_dir, _, _ = _session_dirs(tmp_path)
+    mine = watch.beat(state_dir)
+    (state_dir / "watcher_heartbeat").write_text(f"{mine + 5}\n")
+
+    assert watch.mark_stopped(state_dir, mine) is False
+    assert not (state_dir / "watcher_stopped").exists()
+
+
+def test_a_new_beat_clears_a_previous_stop(tmp_path):
+    state_dir, _, _ = _session_dirs(tmp_path)
+    assert watch.mark_stopped(state_dir, watch.beat(state_dir)) is True
+
+    watch.beat(state_dir)
+
+    assert not (state_dir / "watcher_stopped").exists()
+
+
+def test_sigterm_writes_the_stopped_marker(tmp_path):
+    """TaskStop ends a Monitor with a signal. Without a handler Python dies
+    on SIGTERM with no cleanup, and the page keeps saying Watching for 3 min."""
+    import os
+    import signal
+    import subprocess
+    import sys
+
+    state_dir, events_dir, consumed_dir = _session_dirs(tmp_path)
+    script = (
+        "import sys\n"
+        "from webcompanion.commands import watch\n"
+        "watch.install_stop_handlers()\n"
+        "sys.exit(watch.watch_loop('annotate', 'sid1', sys.argv[1], sys.argv[2], sys.argv[3],"
+        " poll_seconds=0.05))\n"
+    )
+    proc = subprocess.Popen([sys.executable, "-c", script,
+                             str(state_dir), str(events_dir), str(consumed_dir)])
+    try:
+        deadline = time.time() + HARD_TIMEOUT
+        while not (state_dir / "watcher_heartbeat").exists():
+            assert time.time() < deadline, "the watch never beat"
+            time.sleep(0.02)
+        os.kill(proc.pid, signal.SIGTERM)
+        assert proc.wait(timeout=HARD_TIMEOUT) == 0
+    finally:
+        if proc.poll() is None:
+            proc.kill()
+
+    assert (state_dir / "watcher_stopped").exists()

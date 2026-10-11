@@ -51,6 +51,7 @@ from __future__ import annotations
 
 import argparse
 import os
+import signal
 import sys
 import time
 from pathlib import Path
@@ -62,6 +63,13 @@ from webcompanion.registry import Registry
 FINISHED_MARKER = "finished"
 CANCELLED_MARKER = "cancelled"
 HEARTBEAT_FILE = "watcher_heartbeat"
+# Written when a watch is stopped (TaskStop, Ctrl-C, its parent dying), so a
+# page can say "Unwatched" at once instead of after the 180s stale cutoff.
+# The heartbeat itself is LEFT in place: the IDE plugin reads a missing
+# heartbeat as "just armed, leave alone" and would then never pause or end
+# the session -- see server.py `_unfinish`. Every beat removes this marker,
+# so a watcher re-armed on the same sid clears a previous stop within 1s.
+STOPPED_FILE = "watcher_stopped"
 
 DEFAULT_MAX_EMITS = 3
 # 1800 * 1s poll == 30 minutes, the same ack window watcher.sh used.
@@ -79,8 +87,34 @@ def atomic_write(path: Path, text: str) -> None:
     os.replace(tmp, path)
 
 
-def beat(state_dir: Path) -> None:
-    atomic_write(Path(state_dir) / HEARTBEAT_FILE, f"{int(time.time())}\n")
+def beat(state_dir: Path) -> int:
+    """Stamp the heartbeat and return the value written, so the watcher can
+    later tell whether the file still holds ITS beat or a newer watcher's."""
+    now = int(time.time())
+    atomic_write(Path(state_dir) / HEARTBEAT_FILE, f"{now}\n")
+    (Path(state_dir) / STOPPED_FILE).unlink(missing_ok=True)
+    return now
+
+
+class WatchStopped(Exception):
+    """The watch was told to stop: a signal, or its parent went away."""
+
+
+def mark_stopped(state_dir: Path, last_beat: int | None) -> bool:
+    """Write the stopped marker, but only if the heartbeat still holds this
+    watcher's last beat. Another watcher armed on the same sid since then
+    owns the session now, and must not be reported as stopped."""
+    state_dir = Path(state_dir)
+    if last_beat is None or not state_dir.is_dir():
+        return False
+    try:
+        current = int((state_dir / HEARTBEAT_FILE).read_text().strip())
+    except (OSError, ValueError):
+        return False
+    if current != last_beat:
+        return False
+    atomic_write(state_dir / STOPPED_FILE, f"{int(time.time())}\n")
+    return True
 
 
 def terminal_state(state_dir: Path) -> str | None:
@@ -125,7 +159,7 @@ def watch_loop(kind: str, sid: str, state_dir, events_dir, consumed_dir, *,
                 out=None, max_emits: int = DEFAULT_MAX_EMITS,
                 ack_timeout_seconds: float = DEFAULT_ACK_TIMEOUT_SECONDS,
                 poll_seconds: float = DEFAULT_POLL_SECONDS,
-                sleep=time.sleep) -> int:
+                sleep=time.sleep, parent_gone=lambda: False) -> int:
     """The watch loop itself, decoupled from argument parsing and the
     daemon health check so tests can drive it directly against a tmp_path
     with a tiny `poll_seconds`/`ack_timeout_seconds` instead of the real
@@ -144,7 +178,23 @@ def watch_loop(kind: str, sid: str, state_dir, events_dir, consumed_dir, *,
         consumed_dir.mkdir(parents=True, exist_ok=True)
 
     ack_iterations = max(1, int(round(ack_timeout_seconds / poll_seconds)))
+    last_beat = [None]
 
+    def beat_now() -> None:
+        if parent_gone():
+            raise WatchStopped("parent gone")
+        last_beat[0] = beat(state_dir)
+
+    try:
+        return _watch(kind, sid, state_dir, events_dir, consumed_dir, out,
+                      max_emits, ack_iterations, poll_seconds, sleep, beat_now)
+    except (WatchStopped, KeyboardInterrupt):
+        mark_stopped(state_dir, last_beat[0])
+        return 0
+
+
+def _watch(kind, sid, state_dir, events_dir, consumed_dir, out, max_emits,
+           ack_iterations, poll_seconds, sleep, beat_now) -> int:
     while True:
         if not state_dir.is_dir():
             print(f"WEBCOMPANION_CANCELLED skill={kind} sid={sid}", file=out)
@@ -154,7 +204,7 @@ def watch_loop(kind: str, sid: str, state_dir, events_dir, consumed_dir, *,
         if terminal is not None:
             break
 
-        beat(state_dir)
+        beat_now()
         evt = _next_event(events_dir)
         if evt is None:
             sleep(poll_seconds)
@@ -186,7 +236,7 @@ def watch_loop(kind: str, sid: str, state_dir, events_dir, consumed_dir, *,
                 break
             # Keep beating while blocked on the ack, or watcher_seen_at
             # goes stale and a live session looks dead.
-            beat(state_dir)
+            beat_now()
             sleep(poll_seconds)
 
         if acked:
@@ -270,6 +320,19 @@ def run(argv: list[str]) -> int:
               f"watch never creates one.\n"
               f"  list what exists:  webcompanion status", file=sys.stderr)
         return 1
+    install_stop_handlers()
+    parent = os.getppid()
     return watch_loop(args.kind, args.sid, dirs["state_dir"],
                        dirs["events_dir"], dirs["consumed_dir"],
-                       max_emits=args.max_emits)
+                       max_emits=args.max_emits,
+                       parent_gone=lambda: os.getppid() != parent)
+
+
+def install_stop_handlers() -> None:
+    """SIGTERM (TaskStop) and SIGHUP (a closed terminal) end the process
+    without running any cleanup by default, so the stopped marker would never
+    be written. SIGINT already arrives as KeyboardInterrupt."""
+    def stop(signum, _frame):
+        raise WatchStopped(signal.Signals(signum).name)
+    for sig in (signal.SIGTERM, signal.SIGHUP):
+        signal.signal(sig, stop)

@@ -132,6 +132,26 @@ def _watcher_seen_at(state_dir: Path) -> int | None:
         return None
 
 
+# `webcompanion watch` writes this when it is stopped (see watch.py
+# STOPPED_FILE). Reported next to the heartbeat rather than by deleting it:
+# the IDE plugin reads a missing heartbeat as "just armed".
+_STOPPED_FILE = "watcher_stopped"
+
+
+def _watcher_stopped_at(state_dir: Path) -> int | None:
+    """When the last watcher was stopped, or None while one is watching or
+    none ever stopped. A marker older than the heartbeat belongs to an
+    earlier watcher that a newer one has replaced, so it is not reported."""
+    try:
+        stopped = int((Path(state_dir) / _STOPPED_FILE).read_text().strip())
+    except (OSError, ValueError):
+        return None
+    seen = _watcher_seen_at(state_dir)
+    if seen is not None and seen > stopped:
+        return None
+    return stopped
+
+
 # Registered renderer roots are a FILE in the session's workspace, not
 # daemon memory -- the same fix Task 10 applied to finished/cancelled, for
 # the same reason. This daemon restarts on every package upgrade; a dict
@@ -491,6 +511,7 @@ def _make_handler(daemon: Daemon):
                 # already reports per-session, exposed here too so the list
                 # view doesn't need one request per row to show it.
                 "watcher_seen_at": _watcher_seen_at(state_dir) if state_dir is not None else None,
+                "watcher_stopped_at": _watcher_stopped_at(state_dir) if state_dir is not None else None,
                 "url": f"{self._public_url()}/s/{sid}/",
             }
 
@@ -798,7 +819,7 @@ def _make_handler(daemon: Daemon):
             if resolved is None:
                 return
             state_dir = Path(dirs["state_dir"])
-            for marker in (_FINISHED_MARKER, _CANCELLED_MARKER, _HEARTBEAT_FILE):
+            for marker in (_FINISHED_MARKER, _CANCELLED_MARKER, _HEARTBEAT_FILE, _STOPPED_FILE):
                 try:
                     (state_dir / marker).unlink()
                 except FileNotFoundError:
@@ -1206,6 +1227,7 @@ def _make_handler(daemon: Daemon):
                 "finished": _is_marked(state_dir, _FINISHED_MARKER),
                 "cancelled": _is_marked(state_dir, _CANCELLED_MARKER),
                 "watcher_seen_at": _watcher_seen_at(state_dir),
+                "watcher_stopped_at": _watcher_stopped_at(state_dir),
                 "items": items.versions_of(dirs["items_dir"]),
                 "threads": threads.list_versions(dirs["threads_dir"]),
                 "acked": sorted(stream.acked_event_ids(Path(dirs["consumed_dir"]))),
