@@ -1,0 +1,7 @@
+#!/bin/sh
+# Links the tracked hooks into .git/hooks, leaving any other hook there in place.
+top=$(git rev-parse --show-toplevel) || exit 1
+for h in post-commit post-merge post-rewrite post-checkout; do
+  ln -sf "../../githooks/$h" "$top/.git/hooks/$h"
+done
+echo "linked: post-commit post-merge post-rewrite post-checkout"

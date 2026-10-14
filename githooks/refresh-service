@@ -1,0 +1,23 @@
+#!/bin/sh
+# Rebuilds and restarts the launchd service when it runs a different build than this checkout.
+# The CLI is an editable install and follows the source at once; the service runs a frozen
+# zipapp that only `webcompanion install-service` rebuilds. Called by the git hooks beside it.
+
+export PATH="$HOME/.local/bin:$PATH"
+command -v webcompanion >/dev/null 2>&1 || exit 0
+
+log="$HOME/.claude/webcompanion/refresh-service.log"
+builds=$(webcompanion status 2>/dev/null | sed -n 's/^build: daemon \([^ ]*\) \/ cli \([^ ]*\)$/\1 \2/p')
+daemon=${builds% *}
+cli=${builds#* }
+
+if [ -n "$builds" ] && [ "$daemon" = "$cli" ]; then
+  exit 0
+fi
+
+echo "webcompanion: the service runs build ${daemon:-unknown}, this checkout is ${cli:-unknown}; rebuilding it in the background (log: $log)"
+(
+  echo "--- $(date '+%Y-%m-%d %H:%M:%S') daemon ${daemon:-unknown} -> ${cli:-unknown}"
+  webcompanion install-service
+) >>"$log" 2>&1 &
+exit 0
