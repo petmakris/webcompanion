@@ -132,6 +132,8 @@ def expire(cfg: Config, registry: Registry) -> int:
     cutoff = time.time() - cfg.retention_days * 86400
     removed = 0
     for sid, dirs in list(registry.items()):
+        if registry.get_meta(sid).get("kind") in paths.PERSISTENT_KINDS:
+            continue
         activity = _last_activity(dirs)
         if activity is None:
             continue  # can't tell how old it is -- conservative: leave it
@@ -180,6 +182,8 @@ def expire_idle(cfg: Config, registry: Registry, *,
     cutoff = time.time() - cfg.idle_expiry_hours * 3600
     marked = 0
     for sid, dirs in list(registry.items()):
+        if registry.get_meta(sid).get("kind") in paths.PERSISTENT_KINDS:
+            continue  # meant to stay open for good -- see paths.PERSISTENT_KINDS
         state_dir = Path(dirs["state_dir"])
         if is_terminal(state_dir):
             continue  # already finished/cancelled -- nothing to do

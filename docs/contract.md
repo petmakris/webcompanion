@@ -26,7 +26,7 @@ every client kind that talks to it.
   `^[a-z][a-z0-9_-]{0,63}$`.
 
   A kind is a free-form string as far as the daemon is concerned, but the
-  seven that exist have ONE canonical spelling each, and a client that pushes
+  eight that exist have ONE canonical spelling each, and a client that pushes
   a different one gets a separate, invisible partition rather than an error.
   They are, exactly:
 
@@ -38,6 +38,7 @@ every client kind that talks to it.
   interactive-review
   show-diff
   atlas
+  journey
   ```
 
   Note the hyphen in `interactive-review`. `webcompanion migrate` derives a
@@ -53,6 +54,12 @@ every client kind that talks to it.
   produce: it never had a per-skill server or a `~/.claude/show-diff`
   directory to migrate from, having been written against this contract in
   the first place.
+
+  `journey` is claude-annotate's `/journey`: one session per app (slug
+  `mealy`, `billpod`, `tunatutor`), whose page is the app's journey canvas.
+  It is the one **persistent** kind: a session of it is meant to stay open
+  for good, so idle expiry never finishes it, retention never deletes it, and
+  `webcompanion watch` never drops one of its events (see `/api/submit`).
 - **Item** — one opaque JSON body addressed by a client-chosen string
   called an **anchor**. The daemon never inspects an item's shape; it
   stores the body, derives a version from its content hash, and hands both
@@ -214,7 +221,7 @@ once URL-decoded. **write** means the ownership check applies.
 | POST | `/s/{sid}/api/mounts` | write | Register a named directory to serve from disk. Body: `{name, root}`. `name` matches `^[a-z0-9][a-z0-9_-]{0,63}$` (`400` otherwise); `root` must resolve to an existing directory (`400`) **inside the session's `cwd`** (`403`). Stored in the session's workspace (`mounts.json`), so it survives daemon restarts; re-registering a name replaces its root. Returns `200 {name, url}`, `url` relative to the session page. Additive to contract 1. |
 | GET | `/s/{sid}/mounts/<name>/<relpath>` | | Serve `root/relpath` of a registered mount, symlinks resolved, `403` on an escape from the mount or the session's `cwd`, `404` for an unknown mount or a missing file. A path with a segment starting with `.` (`.env`, `.git/config`; `..` is judged by the escape rule), or one whose resolved target has such a segment below the mount root, is `404`: dotfiles are never served. Sent with `Cache-Control: no-store`, so a reload after a save always gets the new bytes. Additive to contract 1. |
 | POST | `/s/{sid}/api/upload` | write | Upload a pasted image. Body is the raw image bytes; `Content-Type` must be one of `image/png`, `image/jpeg`, `image/gif`, `image/webp`. `413` past 10 MB, `415` on an unrecognized type, `411` if `Content-Length` is missing. Returns `200 {path, size}`. |
-| POST | `/s/{sid}/api/submit` | write | Submit a comment/interaction event on an anchor. Body: `{anchor, text, images?}` — `images`, if given, must be paths this same session's own `/api/upload` produced. `400` on a missing/invalid anchor or empty text. Returns `202 {event_id}` — the event is queued for a separate watcher process to consume, not answered synchronously. **Whoever answers the event must acknowledge it**, or the watcher re-emits it (3 attempts, 30 minutes apart) and then drops it: run `webcompanion ack --sid <sid> --event-id <event_id>` on the daemon's own host. There is no HTTP route for the acknowledgement — the queue and the ack are files in the session's workspace, and the only consumer runs beside the daemon. |
+| POST | `/s/{sid}/api/submit` | write | Submit a comment/interaction event on an anchor. Body: `{anchor, text, images?}` — `images`, if given, must be paths this same session's own `/api/upload` produced. `400` on a missing/invalid anchor or empty text. Returns `202 {event_id}` — the event is queued for a separate watcher process to consume, not answered synchronously. **Whoever answers the event must acknowledge it**, or the watcher re-emits it (3 attempts, 30 minutes apart) and then drops it (a persistent kind's event, `journey`, is never dropped: it is re-emitted every 30 minutes until acked): run `webcompanion ack --sid <sid> --event-id <event_id>` on the daemon's own host. There is no HTTP route for the acknowledgement — the queue and the ack are files in the session's workspace, and the only consumer runs beside the daemon. |
 | GET | `/s/{sid}/threads` | | Snapshot of every thread: `{anchor: {anchor, version, messages, title?, anchor_text?}}`. |
 | GET | `/s/{sid}/threads/<anchor>` | | One thread. An anchor nobody has commented on is **not** a `404` — it comes back as `{anchor, version: 0, messages: []}`, because a client asks for the thread of every region it renders and a 404 per un-commented region is noise. `400` if the anchor is invalid. |
 | POST | `/s/{sid}/threads/<anchor>` | write | Append one message. Body: `{text, role?, source_event_id?, title?, anchor_text?}` plus any other keys you want stored on the message. `text` is required and non-empty (`400` otherwise). `role` defaults to `agent`; `ts` (unix seconds) is stamped server-side. `source_event_id` makes the append **idempotent** — a second POST carrying an id already in the thread returns `{appended: false}` and changes nothing, which is what makes the watcher's re-emission safe. `title` is thread-level and last-write-wins; `anchor_text` is thread-level and first-write-wins. Returns `200 {appended, version}`. |

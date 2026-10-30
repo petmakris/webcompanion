@@ -23,6 +23,13 @@ from webcompanion.config import Config
 
 # A kind names a directory, so it must not be able to escape one.
 VALID_KIND_RE = re.compile(r"^[a-z][a-z0-9_-]{0,63}$")
+
+# Kinds whose sessions are meant to live for good: one per subject, reopened
+# for weeks, the only copy of what was said on them. Idle expiry never
+# finishes them, retention never deletes them, and `watch` never drops one of
+# their events (it re-emits until acked). `journey` is one canvas per app
+# (claude-annotate's /journey).
+PERSISTENT_KINDS = frozenset({"journey"})
 VALID_SID_RE = re.compile(r"^[A-Za-z0-9_-]{1,128}$")
 
 MARKER_FILE = "workspace.json"

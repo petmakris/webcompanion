@@ -404,3 +404,55 @@ def test_sigterm_writes_the_stopped_marker(tmp_path):
             proc.kill()
 
     assert (state_dir / "watcher_stopped").exists()
+
+
+# ── max_emits 0: a persistent kind never drops an event ─────────────────
+
+def test_max_emits_zero_re_emits_without_ever_dropping(tmp_path):
+    state_dir = tmp_path / "state"
+    events_dir = tmp_path / "events"
+    consumed_dir = tmp_path / "consumed"
+    state_dir.mkdir()
+    event_id = "00000000000000000009-1-000000"
+    _write_event(events_dir, event_id, {"anchor": "b-1", "text": "answer me"})
+    buf = io.StringIO()
+    calls = {"n": 0}
+
+    def fake_sleep(_seconds):
+        calls["n"] += 1
+        if calls["n"] >= 12:
+            (state_dir / "finished").touch()
+
+    rc = run_with_hard_timeout(
+        lambda: watch.watch_loop("journey", "sid-9", state_dir, events_dir,
+                                  consumed_dir, out=buf, poll_seconds=0.001,
+                                  ack_timeout_seconds=0.001, max_emits=0,
+                                  sleep=fake_sleep)
+    )
+
+    out = buf.getvalue()
+    assert rc == 0
+    assert out.count("WEBCOMPANION_EVENT") > 3
+    assert "WEBCOMPANION_DROPPED" not in out
+    assert (events_dir / f"{event_id}.json").exists()
+    assert not (consumed_dir / f"{event_id}.json").exists()
+
+
+def test_the_journey_kind_defaults_to_never_dropping(tmp_path, monkeypatch):
+    seen = []
+    monkeypatch.setattr(watch, "client_from_config", lambda: None)
+    monkeypatch.setattr(watch, "preflight", lambda _c: None)
+    monkeypatch.setattr(watch, "resolve_session_dirs", lambda kind, sid: {
+        "state_dir": tmp_path, "events_dir": tmp_path / "e", "consumed_dir": tmp_path / "c"})
+
+    monkeypatch.setattr(watch, "install_stop_handlers", lambda: None)
+
+    def fake_loop(kind, sid, *dirs, max_emits, **_kw):
+        seen.append((kind, max_emits))
+        return 0
+
+    monkeypatch.setattr(watch, "watch_loop", fake_loop)
+    watch.run(["--kind", "journey", "--sid", "s"])
+    watch.run(["--kind", "annotate", "--sid", "s"])
+    watch.run(["--kind", "annotate", "--sid", "s", "--max-emits", "0"])
+    assert seen == [("journey", 0), ("annotate", 3), ("annotate", 0)]

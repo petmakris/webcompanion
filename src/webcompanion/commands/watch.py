@@ -23,7 +23,10 @@ this replaces, and all of it survives the port:
     3), so one perpetually-unanswered event cannot wedge the
     serially-processed queue behind it forever. Giving up prints
     `WEBCOMPANION_DROPPED` loudly -- the user must be told their question
-    was dropped, not left watching a spinner vanish.
+    was dropped, not left watching a spinner vanish. `max_emits` 0 never
+    gives up, and is the default for a persistent kind
+    (`paths.PERSISTENT_KINDS`): a `journey` comment that nobody answered
+    stays queued until some session does.
   * Events are consumed in filename order: `events.append` names each file
     with a fixed-width, zero-padded `time_ns`, so a lexical sort is a
     chronological one.
@@ -252,7 +255,7 @@ def _watch(kind, sid, state_dir, events_dir, consumed_dir, out, max_emits,
         except (OSError, ValueError):
             n = 0
         n += 1
-        if n >= max_emits:
+        if max_emits and n >= max_emits:
             _archive(evt, consumed_dir, event_id)
             # Giving up must be loud: one final banner so the user is told
             # their question was dropped, instead of a spinner that
@@ -299,7 +302,9 @@ def build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(prog="webcompanion watch")
     p.add_argument("--kind", required=True)
     p.add_argument("--sid", required=True)
-    p.add_argument("--max-emits", type=int, default=DEFAULT_MAX_EMITS)
+    p.add_argument("--max-emits", type=int, default=None,
+                   help="emits before an unacked event is dropped; 0 never drops. "
+                        "Default 3, and 0 for a persistent kind (journey)")
     return p
 
 
@@ -322,9 +327,12 @@ def run(argv: list[str]) -> int:
         return 1
     install_stop_handlers()
     parent = os.getppid()
+    max_emits = args.max_emits
+    if max_emits is None:
+        max_emits = 0 if args.kind in paths.PERSISTENT_KINDS else DEFAULT_MAX_EMITS
     return watch_loop(args.kind, args.sid, dirs["state_dir"],
                        dirs["events_dir"], dirs["consumed_dir"],
-                       max_emits=args.max_emits,
+                       max_emits=max_emits,
                        parent_gone=lambda: os.getppid() != parent)
 
 

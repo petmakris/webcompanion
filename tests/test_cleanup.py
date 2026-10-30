@@ -493,3 +493,43 @@ def test_a_lone_stray_under_a_kind_is_still_reaped(tmp_path):
     assert summary["strays_refused"] is None
     assert summary["strays_removed"] == 1
     assert not orphan.exists()
+
+
+# ── persistent kinds: a journey canvas is never expired ────────────────
+
+def _age(dirs, seconds):
+    import os
+    stale = time.time() - seconds
+    os.utime(paths.base_of(dirs), (stale, stale))
+    for key in ("items_dir", "threads_dir", "state_dir"):
+        os.utime(dirs[key], (stale, stale))
+
+
+def test_expire_idle_never_finishes_a_journey_session(tmp_path):
+    from webcompanion.server import _FINISHED_MARKER, _is_marked
+
+    is_terminal, mark_finished = _server_injections()
+    cfg = Config(workspace_root=tmp_path / "ws", idle_expiry_hours=12)
+    reg = Registry(tmp_path / "state")
+    journey = _session(reg, cfg, "journey", "mealy-canvas")
+    other = _session(reg, cfg, "annotate", "idle-one")
+    _age(journey, 3600 * 48)
+    _age(other, 3600 * 48)
+
+    assert cleanup.expire_idle(cfg, reg, is_terminal=is_terminal,
+                               mark_finished=mark_finished) == 1
+    assert not _is_marked(Path(journey["state_dir"]), _FINISHED_MARKER)
+    assert _is_marked(Path(other["state_dir"]), _FINISHED_MARKER)
+
+
+def test_retention_never_deletes_a_journey_session(tmp_path):
+    cfg = Config(workspace_root=tmp_path / "ws", retention_days=30)
+    reg = Registry(tmp_path / "state")
+    journey = _session(reg, cfg, "journey", "mealy-canvas")
+    other = _session(reg, cfg, "annotate", "old-one")
+    _age(journey, 86400 * 400)
+    _age(other, 86400 * 400)
+
+    assert cleanup.expire(cfg, reg) == 1
+    assert paths.base_of(journey).is_dir()
+    assert not paths.base_of(other).exists()
